@@ -9,7 +9,7 @@ from lablog.sources import collect_codex, collect_markdown, period_bounds
 from lablog.workflow import freeze_draft, validate_submission, SubmissionBlocked
 from lablog.dws import template_fingerprint, encode_contents, DwsBlocked, DwsClient
 from lablog.report import build_draft
-from lablog.cli import _approval_context, _deduplicate_facts, _outbox_history, _preview_markdown, _readback_matches, _submit, _reconcile
+from lablog.cli import _approval_context, _deduplicate_facts, _outbox_history, _preview_markdown, _readback_matches, _report_period, _submit, _reconcile, _verify_recipients
 from lablog.config import is_workday, schedule_due
 from lablog.ai import validate_ai_result
 
@@ -257,6 +257,34 @@ def test_preview_includes_full_body_quality_warnings_and_duplicate_scope():
     assert "工时留空" in markdown and "date encoding unverified" in markdown
     assert "2026-10-01 至 2026-10-13T18:00:00+08:00" in markdown
     assert "period could not be verified" in markdown
+
+
+def test_period_marker_round_trips_from_a_report_content_field():
+    from lablog.periods import format_period_marker, parse_period_marker
+    marker = format_period_marker("weekly", "2026-10-13")
+    assert marker == "统计周期：2026-10-12 至 2026-10-18"
+    assert parse_period_marker("本周工作：\n" + marker + "\n完成实验记录") == ("2026-10-12", "2026-10-18")
+    class DetailClient:
+        def detail(self, report_id):
+            return {"contents": [{"key": "本周完成工作", "content": marker}]}
+    assert _report_period({"reportId": "r"}, DetailClient(), "学生周报") == ("2026-10-12", "2026-10-18")
+
+
+def test_doctor_and_submission_share_duplicate_recipient_validation():
+    cfg = {"identity": {"corp_name": "lab"}, "recipients": [
+        {"name": "Recipient", "user_id": "r", "corp_name": "lab"},
+        {"name": "Recipient", "user_id": "r", "corp_name": "lab"}]}
+    class ContactClient:
+        calls = 0
+        def contact(self, user_id):
+            self.calls += 1
+            return {"orgUserName": "Recipient", "orgName": "lab"}
+    client = ContactClient()
+    user_ids, results, blockers = _verify_recipients(cfg, client)
+    assert user_ids == ["r"]
+    assert [x["verified"] for x in results] == [True, False]
+    assert blockers == ["recipient ID missing, duplicated or unlabeled"]
+    assert client.calls == 1
 
 
 @pytest.mark.parametrize("kind,day,start,end", [

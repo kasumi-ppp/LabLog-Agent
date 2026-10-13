@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import re
 import sys
 import unicodedata
 from datetime import date, datetime, timedelta
@@ -17,6 +16,7 @@ from .config import load_config, resolve_path, schedule_due
 from .dws import DwsBlocked, DwsClient, encode_contents, template_fingerprint
 from .report import build_draft
 from .sources import collect_codex, collect_git, collect_markdown, period_bounds
+from .periods import parse_period_marker, period_labels
 from .workflow import SubmissionBlocked, atomic_json, atomic_text, draft_hash, file_lock, validate_submission
 
 CHINA = ZoneInfo("Asia/Shanghai")
@@ -39,10 +39,7 @@ def _period_identity(draft):
 
 
 def _period_labels(kind, day):
-    start, end = period_bounds(kind, date.fromisoformat(day))
-    start_day = start.astimezone(CHINA).date().isoformat()
-    end_day = (end - timedelta(microseconds=1)).astimezone(CHINA).date().isoformat()
-    return start_day, end_day
+    return period_labels(kind, day)
 
 
 def _state_path(cfg, draft):
@@ -208,19 +205,17 @@ def _report_period(report, client, template_name):
             if start and end:
                 markers.append((str(start)[:10], str(end)[:10]))
         elif isinstance(value, str):
-            match = re.search(r"统计周期：\s*(\d{4}-\d{2}-\d{2})\s*(?:至|—|\.\.)\s*(\d{4}-\d{2}-\d{2})", value)
-            if match:
-                markers.append(match.groups())
+            marker = parse_period_marker(value)
+            if marker:
+                markers.append(marker)
     contents = candidate.get("contents") or candidate.get("report_entry_contents") or candidate.get("reportContents")
     if isinstance(contents, list):
         for item in contents:
             if not isinstance(item, dict):
                 continue
-            if item.get("key") in {"统计周期", "工作周期"}:
-                value = str(item.get("content", ""))
-                match = re.search(r"统计周期：\s*(\d{4}-\d{2}-\d{2})\s*(?:至|—|\.\.)\s*(\d{4}-\d{2}-\d{2})", value)
-                if match:
-                    markers.append(match.groups())
+            marker = parse_period_marker(item.get("content"))
+            if marker:
+                markers.append(marker)
             if item.get("key") == "工作日期" and isinstance(item.get("content"), str):
                 try:
                     work_day = date.fromisoformat(item["content"])
@@ -248,6 +243,33 @@ def _has_period_duplicate(cfg, client, template_name, draft):
         if period == (start, end):
             return True
     return False
+
+
+def _verify_recipients(cfg, client):
+    """Return validated recipient IDs, display results, and shared blockers."""
+    recipients = cfg.get("recipients")
+    if not isinstance(recipients, list) or not recipients:
+        return [], [], ["recipient IDs missing"]
+    identity = cfg.get("identity") or {}
+    user_ids, results, blockers, seen = [], [], [], set()
+    for recipient in recipients:
+        recipient = recipient if isinstance(recipient, dict) else {}
+        name, user_id = recipient.get("name"), recipient.get("user_id")
+        issue = None
+        if not user_id or user_id in seen or not name:
+            issue = "recipient ID missing, duplicated or unlabeled"
+        else:
+            seen.add(user_id)
+            contact = client.contact(user_id)
+            expected_org = recipient.get("corp_name") or identity.get("corp_name")
+            if contact.get("orgUserName") != name or contact.get("orgName") != expected_org:
+                issue = "recipient identity mismatch"
+        results.append({"name": name, "verified": issue is None, "reason": issue})
+        if issue:
+            blockers.append(issue)
+        else:
+            user_ids.append(user_id)
+    return user_ids, results, blockers
 
 
 def _preview_markdown(draft, context, duplicate):
@@ -296,18 +318,9 @@ def _preflight(cfg, draft, *, duplicate_check=True):
     template = client.template(template_cfg["name"], template_cfg["id"])
     if template_fingerprint(template) != draft.get("template_fingerprint"):
         raise SubmissionBlocked("template drift")
-    recipients = cfg.get("recipients") or []
-    if not isinstance(recipients, list) or not recipients:
-        raise SubmissionBlocked("recipient IDs missing")
-    user_ids = []
-    for recipient in recipients:
-        uid = recipient.get("user_id")
-        if not uid or uid in user_ids or not recipient.get("name"):
-            raise SubmissionBlocked("recipient ID missing, duplicated or unlabeled")
-        contact = client.contact(uid)
-        if contact.get("orgUserName") != recipient["name"] or contact.get("orgName") != (recipient.get("corp_name") or identity.get("corp_name")):
-            raise SubmissionBlocked("recipient identity mismatch")
-        user_ids.append(uid)
+    user_ids, _, recipient_blockers = _verify_recipients(cfg, client)
+    if recipient_blockers:
+        raise SubmissionBlocked("; ".join(recipient_blockers))
     if template.get("allowAddReceivers") == 0:
         raise SubmissionBlocked("template disallows adding explicit recipients; receiver semantics unverified")
     if duplicate_check and _has_period_duplicate(cfg, client, template_cfg["name"], draft):
@@ -455,16 +468,11 @@ def main(argv=None):
                 live = client.template(configured["name"], configured["id"])
                 template_info[kind] = {"fingerprint": template_fingerprint(live),
                                        "allow_add_receivers": live.get("allowAddReceivers")}
-            recipient_results = []
-            for recipient in cfg.get("recipients") or []:
-                contact = client.contact(recipient.get("user_id", ""))
-                recipient_results.append({"name": recipient.get("name"),
-                                          "verified": contact.get("orgUserName") == recipient.get("name") and contact.get("orgName") == (recipient.get("corp_name") or identity.get("corp_name"))})
+            _, recipient_results, recipient_blockers = _verify_recipients(cfg, client)
             blockers = []
             if not identity_ok:
                 blockers.append("DWS identity mismatch")
-            if not recipient_results or not all(x["verified"] for x in recipient_results):
-                blockers.append("recipient identity mismatch or missing")
+            blockers.extend(recipient_blockers)
             if not (cfg.get("date_encoding") or {}).get("verified"):
                 blockers.append("date encoding unverified for daily submission")
             if not cfg.get("history_from"):

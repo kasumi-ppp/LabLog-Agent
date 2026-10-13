@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
-from datetime import date, timedelta
-from zoneinfo import ZoneInfo
 import re
 
 from .dws import template_fields, template_fingerprint
-from .sources import period_bounds
+from .periods import format_period_marker
 from .workflow import freeze_draft
 
 FIELDS = {
@@ -69,11 +67,7 @@ def build_draft(kind, day, template, evidence, *, manual_text=None, hours=None, 
             raise ValueError("invalid hours")
         values[names["hours"]] = format(parsed, "f")
     fields = []
-    period_start, period_end = period_bounds(kind, date.fromisoformat(day))
-    china = ZoneInfo("Asia/Shanghai")
-    start_label = period_start.astimezone(china).date().isoformat()
-    end_label = (period_end - timedelta(microseconds=1)).astimezone(china).date().isoformat()
-    values[names["completed"]] = f"统计周期：{start_label} 至 {end_label}\n" + values[names["completed"]]
+    values[names["completed"]] = format_period_marker(kind, day) + "\n" + values[names["completed"]]
     for field in template_fields(template):
         name = field["field_name"]
         if name in values:
