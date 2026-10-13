@@ -89,7 +89,10 @@ def collect_codex(roots, kind, day, *, project_paths=(), session_ids=(), exclude
             files.append(path)
         elif path.is_dir():
             files.extend(path.rglob("*.jsonl"))
-    for path in sorted(set(files))[:max_files]:
+    files = sorted(set(files))
+    if len(files) > max_files:
+        warnings.append(f"session file limit reached; omitted {len(files) - max_files}")
+    for path in files[:max_files]:
         try:
             with path.open("r", encoding="utf-8") as stream:
                 rows = stream.readlines()
@@ -166,7 +169,10 @@ def collect_git(paths, kind, day):
         if proc.returncode:
             warnings.append(f"git log failed: {root.name}")
             continue
-        for row in proc.stdout.splitlines():
+        rows = proc.stdout.splitlines()
+        if len(rows) >= 200:
+            warnings.append(f"git commit limit reached: {root.name}")
+        for row in rows:
             parts = row.split("\t", 2)
             if len(parts) != 3 or SECRET.search(parts[2]):
                 continue
@@ -196,14 +202,16 @@ def collect_git(paths, kind, day):
     return {"facts": facts, "warnings": warnings}
 
 
-def collect_markdown(paths, kind=None, day=None):
+def collect_markdown(paths, kind=None, day=None, *, max_files=500):
     facts, warnings = [], []
     bounds = period_bounds(kind, day) if kind and day else None
     for value in paths:
         explicit = Path(value).expanduser()
         if explicit.is_dir():
-            files = list(explicit.rglob("*.md")) + list(explicit.rglob("*.markdown"))
-            files = files[:500]
+            files = sorted(set(list(explicit.rglob("*.md")) + list(explicit.rglob("*.markdown"))))
+            if len(files) > max_files:
+                warnings.append(f"markdown file limit reached: {explicit.name}; omitted {len(files) - max_files}")
+            files = files[:max_files]
         elif explicit.is_file() and explicit.suffix.lower() in {".md", ".markdown"}:
             files = [explicit]
         else:
@@ -216,7 +224,11 @@ def collect_markdown(paths, kind=None, day=None):
                 if not resolved.is_relative_to(root):
                     warnings.append(f"markdown symlink escapes configured path: {path.name}")
                     continue
-                raw = path.read_text(encoding="utf-8")[:12000]
+                with path.open("r", encoding="utf-8") as stream:
+                    raw = stream.read(12001)
+                if len(raw) > 12000:
+                    warnings.append(f"markdown content limit reached: {path.name}; truncated after 12000 characters")
+                    raw = raw[:12000]
             except (OSError, UnicodeError):
                 warnings.append(f"markdown unreadable: {path.name}")
                 continue

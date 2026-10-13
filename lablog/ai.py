@@ -15,6 +15,35 @@ SCHEMA = {"type": "object", "additionalProperties": False,
           "properties": {"completed": {"type": "string"}, "summary": {"type": "string"},
                          "plan": {"type": "string"},
                          "citations": {"type": "array", "items": {"type": "string"}}}}
+COMPLETION_CLAIM = re.compile(
+    r"(?i)(?:已经?(?:完成|部署|上线|发布|修复|提交|实现)|完成(?:了)?(?:部署|上线|发布|修复|迁移|验证|开发|实现|提交)|"
+    r"部署完成|上线完成|发布完成|修复完成|实现完成|提交成功|测试(?:全部)?通过|回归通过|"
+    r"implemented|fixed|completed|deployed|tests pass(?:ed)?|successfully implemented)"
+)
+CHINESE_RUN = re.compile(r"[\u3400-\u9fff]+")
+ENGLISH_TOKEN = re.compile(r"[a-z0-9]{3,}")
+CHINESE_STOPWORDS = {"完成", "项目", "工作", "系统", "报告", "内容", "实现", "方法", "用户", "测试"}
+
+
+def _claim_features(text):
+    value = re.sub(r"\[证据:[^\]]+\]", "", str(text)).casefold()
+    chinese = set()
+    for run in CHINESE_RUN.findall(value):
+        chinese.update(run[i:i + 2] for i in range(len(run) - 1))
+    return chinese - CHINESE_STOPWORDS, set(ENGLISH_TOKEN.findall(value))
+
+
+def _has_lexical_support(claim, source):
+    claim_chinese, claim_english = _claim_features(claim)
+    source_chinese, source_english = _claim_features(source)
+    if claim_chinese & source_chinese or claim_english & source_english:
+        return True
+    if claim_chinese and source_chinese:
+        return False
+    if claim_english and source_english:
+        return False
+    # Different-language paraphrases need a person to assess semantic support in preview.
+    return True
 
 
 def validate_ai_result(result, facts):
@@ -37,6 +66,8 @@ def validate_ai_result(result, facts):
             raise ValueError("Codex claim lacks known source citation")
         prose = re.sub(r"\[证据:[^\]]+\]", "", line)
         source_text = " ".join(str(fact_by_id[c].get("text", "")) for c in cited)
+        if any(not _has_lexical_support(prose, str(fact_by_id[c].get("text", ""))) for c in cited):
+            raise ValueError("Codex claim has no lexical support in its cited evidence")
         if not set(re.findall(r"\d+(?:\.\d+)?", prose)) <= set(re.findall(r"\d+(?:\.\d+)?", source_text)):
             raise ValueError("Codex introduced unsupported numbers")
     for line in result["completed"].splitlines():
@@ -47,6 +78,13 @@ def validate_ai_result(result, facts):
         cited = re.findall(r"\[证据:([^\]]+)\]", line)
         if cited and any(fact_by_id[c].get("status") != "planned" for c in cited):
             raise ValueError("Codex plan claim has no planned evidence")
+    for line in result["summary"].splitlines():
+        cited = re.findall(r"\[证据:([^\]]+)\]", line)
+        if not cited:
+            continue
+        prose = re.sub(r"\[证据:[^\]]+\]", "", line)
+        if COMPLETION_CLAIM.search(prose) and any(fact_by_id[c].get("status") != "completed" for c in cited):
+            raise ValueError("Codex summary cannot present planned evidence as completed")
     return result
 
 
@@ -61,7 +99,7 @@ def synthesize(config, evidence, kind, day):
     payload = {"kind": kind, "date": day, "facts": facts}
     prompt = ("Create concise Chinese report text only from the JSON evidence below. "
               "Return completed, summary, plan, citations as JSON. Each claim must cite an evidence_id in the text "
-              "using [证据:ID]. User requests and plans are not completed work. Stated completion is unverified. "
+              "using [证据:ID]. Every claim must share concrete terms with the cited evidence unless it is clearly a cross-language paraphrase. User requests and plans are not completed work. Stated completion is unverified. "
               "Never invent hours, attendance, dates, numbers, files, or completed outcomes. "
               "Do not quote private messages verbatim.\n" + json.dumps(payload, ensure_ascii=False))
     with tempfile.TemporaryDirectory() as directory:

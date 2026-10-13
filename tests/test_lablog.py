@@ -418,6 +418,28 @@ def test_assisted_ai_rejects_planned_claim_laundered_with_completed_citation():
                             "summary": "", "plan": "", "citations": ["p", "c"]}, facts)
 
 
+def test_assisted_ai_rejects_planned_evidence_in_completed_summary():
+    facts = [{"evidence_id": "p", "status": "planned", "text": "Plan production deployment"}]
+    with pytest.raises(ValueError, match="planned evidence as completed"):
+        validate_ai_result({"completed": "", "summary": "Completed production deployment [证据:p]",
+                            "plan": "", "citations": ["p"]}, facts)
+
+
+@pytest.mark.parametrize("claim", ["完成部署生产环境", "已部署生产环境", "部署完成并迁移数据"])
+def test_assisted_ai_rejects_common_deployment_completion_claims_from_planned_evidence(claim):
+    facts = [{"evidence_id": "p", "status": "planned", "text": "计划部署生产环境并迁移数据"}]
+    with pytest.raises(ValueError, match="planned evidence as completed"):
+        validate_ai_result({"completed": "", "summary": f"{claim} [证据:p]",
+                            "plan": "", "citations": ["p"]}, facts)
+
+
+def test_assisted_ai_rejects_claim_unrelated_to_its_citation():
+    facts = [{"evidence_id": "x", "status": "completed", "text": "完成本地文档校验"}]
+    with pytest.raises(ValueError, match="lexical support"):
+        validate_ai_result({"completed": "已部署生产环境并完成数据迁移 [证据:x]",
+                            "summary": "", "plan": "", "citations": ["x"]}, facts)
+
+
 def test_reconcile_known_id_verifies_exact_readback(tmp_path, monkeypatch):
     cfg, path, draft, fake = _ready_submission(tmp_path, monkeypatch, outcome="mismatch")
     with pytest.raises(SubmissionBlocked):
@@ -503,3 +525,46 @@ def test_unknown_future_assistant_message_does_not_count_as_completed():
     draft = build_draft("daily", "2026-10-13", template, evidence)
     assert "明天准备复现模型" not in next(x["value"] for x in draft["fields"] if x["name"] == "今日完成")
     assert "no dated completion evidence" in draft["blockers"]
+
+
+def test_codex_collection_warns_when_session_file_cap_truncates(tmp_path):
+    root = tmp_path / "sessions"
+    root.mkdir()
+    for name in ("a.jsonl", "b.jsonl"):
+        (root / name).write_text("{}\n", encoding="utf-8")
+    result = collect_codex([root], "daily", date(2026, 10, 13), project_paths=["E:/work/project"], max_files=1)
+    assert any("session file limit reached" in warning and "omitted 1" in warning
+               for warning in result["warnings"])
+
+
+def test_markdown_collection_warns_when_file_cap_truncates(tmp_path):
+    for name in ("a.md", "b.md"):
+        (tmp_path / name).write_text("---\ndate: 2026-10-13\nstatus: completed\n---\n完成本地校验。\n", encoding="utf-8")
+    result = collect_markdown([tmp_path], "daily", date(2026, 10, 13), max_files=1)
+    assert len(result["facts"]) == 1
+    assert any("markdown file limit reached" in warning and "omitted 1" in warning
+               for warning in result["warnings"])
+
+
+def test_markdown_collection_warns_when_a_single_file_is_truncated(tmp_path):
+    note = tmp_path / "large.md"
+    note.write_text("---\ndate: 2026-10-13\nstatus: completed\n---\n" + "校验" * 6000, encoding="utf-8")
+    result = collect_markdown([note], "daily", date(2026, 10, 13))
+    assert len(result["facts"]) == 1
+    assert any("markdown content limit reached" in warning and "large.md" in warning
+               for warning in result["warnings"])
+
+
+def test_git_collection_warns_when_commit_limit_is_reached(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import lablog.sources as sources
+
+    rows = "\n".join(f"{i:040x}\t2026-10-13T01:00:00+00:00\tchange {i}" for i in range(200))
+    def fake_run(command, **kwargs):
+        if "log" in command:
+            return SimpleNamespace(returncode=0, stdout=rows)
+        return SimpleNamespace(returncode=0, stdout="")
+    monkeypatch.setattr(sources.subprocess, "run", fake_run)
+    result = sources.collect_git([tmp_path], "daily", date(2026, 10, 13))
+    assert len(result["facts"]) == 200
+    assert any("git commit limit reached" in warning for warning in result["warnings"])
