@@ -19,7 +19,9 @@
 | calendar.file | 对应年度的节假日/调休日历，包含来源和更新时间 |
 | schedule | 时间、周截止日、月截止日；auto_submit 必须 false |
 
-本机首轮配置只采集当前 LabLog-Agent 项目。要整合其他 Codex 工作，将其项目目录加入 project_paths；按项目筛选仍会自动收集该项目相关会话。需要限定具体会话可再填写 session_ids。不要把 Codex 全部会话默认视为科研工作。
+本机首轮配置只采集当前 LabLog-Agent 项目。要整合其他 Codex 工作，将其项目目录加入 project_paths；按项目筛选仍会自动收集该项目相关会话。需要限定具体会话可再填写 session_ids。没有项目路径或会话 ID 时不采集 Codex 会话。完全一致的重复片段会合并并保留来源，计划和完成等状态不同的内容分开处理。不要把 Codex 全部会话默认视为科研工作。
+
+`history_from` 是远端重复检查的最早创建时间；如需覆盖更早报告，首次生成前应把它设到足够早的日期。范围之外的历史不会被视为“没有重复”，提交会因查重覆盖不足而停止。
 
 Markdown 记录要显式标注实际工作日期，推荐 YAML frontmatter 的 `date: YYYY-MM-DD`、`status: completed|in_progress|planned|unknown`；状态需与内容一致。文件修改日期不能证明工作发生日期，Git 提交也不能证明测试通过。真正的工时可在生成时输入 `--hours`。
 

@@ -11,14 +11,16 @@ Python 3.11+，已有官方 DWS、Codex CLI 和钉钉官方技能。
 ```powershell
 python -m pip install -e '.[test]'
 Copy-Item config/config.example.yaml config/config.local.yaml
-# 编辑本地配置中的执行文件、身份、收件人和工作项目范围
+# 编辑本地配置中的执行文件、身份、收件人和工作项目范围；至少配置一个 Codex 项目路径或会话 ID
 python -X utf8 -m lablog --config config/config.local.yaml doctor
 python -X utf8 -m lablog --config config/config.local.yaml collect --kind daily --date 2026-10-13
 python -X utf8 -m lablog --config config/config.local.yaml generate --kind daily --date 2026-10-13 --engine codex
 python -X utf8 -m lablog --config config/config.local.yaml preview --draft data/drafts/daily-2026-10-13.json
 ```
 
-改为 `--kind weekly` 或 `monthly`，会统计该日期所在自然周/月。`--engine extractive` 是本地采集检查模式，不冒充 AI 总结。AI 模式沿用 Codex 已登录账号及当前模型，输出需要来源引用；生成失败不静默降级成“AI 已完成”。
+改为 `--kind weekly` 或 `monthly`，会统计该日期所在自然周/月。`--engine extractive` 是本地采集检查模式，不冒充 AI 总结。AI 模式沿用 Codex 已登录账号及当前模型，输出需要来源引用；生成失败不静默降级成“AI 已完成”。桌面 Codex 也可读取 collect 证据并通过 `--engine assisted --ai-result-file <结构化总结JSON>` 生成，仍经过同样的来源和状态校验。
+
+采集会合并标点/空白不同但正文相同、且状态一致的记录，并保留各来源引用；不同状态不会被合并。语义相近但措辞不同的片段由 AI 总结模式处理，extractive 模式不会伪称完成了语义去重。
 
 使用 `--manual-text-file <UTF-8文件>` 保留人工提供的心得原文，`--hours <实际小时数>` 录入真实工时。未知工时不会填默认值，计划不会当成成果。
 

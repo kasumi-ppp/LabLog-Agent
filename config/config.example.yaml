@@ -1,0 +1,55 @@
+# Copy to config/config.local.yaml. Keep real identity and recipient IDs local.
+data_dir: data
+dws:
+  executable: D:/npm-global/node_modules/dingtalk-workspace-cli/vendor/dws.exe
+  profile: "REPLACE_WITH_LOCAL_PROFILE"
+  timeout_seconds: 30
+codex:
+  executable: D:/npm-global/node_modules/@openai/codex/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe
+  session_roots:
+    - C:/Users/USERNAME/.codex/sessions
+    - C:/Users/USERNAME/.codex/archived_sessions
+  mode: auto_work  # auto_work or selected
+  project_paths: []  # Explicit work paths. Empty collects no Codex sessions.
+  exclude_paths: []
+  session_ids: []
+  timeout_seconds: 120
+supplemental:
+  git_paths: []
+  markdown_paths: []
+identity:
+  corp_id: ""
+  user_id: ""
+  user_name: ""
+  corp_name: YOUR_ORGANIZATION
+recipients:
+  - name: REPLACE_WITH_VERIFIED_RECIPIENT_NAME
+    user_id: ""
+    corp_name: YOUR_ORGANIZATION
+templates:
+  daily:
+    id: 166204ed81b1bff216e9471496581054
+    name: 学生日报
+  weekly:
+    id: 166addbca425733a068460e40b1a0c5a
+    name: 学生周报
+  monthly:
+    id: 166addbe41d0c0d38fb707b4375af628
+    name: 学生月报
+# Date encoding has not been verified from official DWS behavior. Submission stays blocked.
+date_encoding:
+  verified: false
+  format: unknown
+quality:
+  omit_hours: true  # User preference: leave 总工时/h empty.
+history_from: "2026-01-01"  # Required for remote duplicate guard, earliest report to inspect.
+calendar:
+  file: config/calendars/2026.json
+schedule:
+  engine: codex
+  daily_time: "18:00"
+  weekly_time: "18:00"
+  monthly_time: "18:00"
+  weekly_weekday: 4  # 0=Monday
+  monthly_day: last
+  auto_submit: false

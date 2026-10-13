@@ -8,6 +8,7 @@
 | Git | 2.50.0.windows.1；用户授权新建 main 和 origin |
 | DWS | 1.0.63；使用现有认证，未重复登录 |
 | Codex CLI | 0.159.2；已通过 ChatGPT 登录 |
+| Codex 非交互生成 | 实测模型列表请求超时，最小只读 OK 提示亦未完成；当前桌面整理可用，不能声称 CLI 后台 AI 已验收 |
 | 官方钉钉技能 | 已安装 dingtalk-misc、aisearch、contact 等；实际位置为 ~/.agents/skills |
 | 当前组织/账号 | 已实时核验，与用户指定目标一致；固定本地 profile |
 | 收件人 | 姓名搜索多候选中精确匹配唯一，再通过通讯录详情核对；真实 ID 仅保留本地 |
@@ -23,6 +24,6 @@
 
 沙盒下读取 DWS 用户目录可能发生文件锁或拒绝访问，甚至出现误导性的“未登录”。本次通过获准的只读环境检查确认实际已登录。不能据此删除认证文件或重置登录。
 
-无人值守生成沿用当前 Windows 用户的 Codex/DWS 登录；没有将 Token 存入项目。实际重启、登出、Token 到期刷新和任务计划程序后台运行仍需要在目标机器条件下验收。系统不启用无人值守真实提交。
+无人值守生成沿用当前 Windows 用户的 Codex/DWS 登录；没有将 Token 存入项目。Codex CLI 网络连接尚有阻塞，后台 AI 生成未完成验收；可先验收 extractive 采集草稿。实际重启、登出、Token 到期刷新和任务计划程序后台运行仍需要在目标机器条件下验收。系统不启用无人值守真实提交。
 
 官方依据：[DWS Report 契约](https://github.com/DingTalk-Real-AI/dingtalk-workspace-cli/blob/4cd5d05393a8748e89d9265eb9f7ec85745a0331/skills/multi/dingtalk-misc/references/report.md)、[2026 年节假日安排](https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm)。

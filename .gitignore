@@ -6,6 +6,7 @@ __pycache__/
 data/
 config/*.local.*
 .env
+**/runtime.local.json
 .superpowers/
 work-records/private/
 dist/
