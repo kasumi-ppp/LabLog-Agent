@@ -1,0 +1,6 @@
+interface:
+  display_name: "iSyslab 日志助手"
+  short_description: "整合 Codex 工作证据，生成学生日报周报月报并预览确认后提交"
+  default_prompt: "使用 $isyslab-report 整理今天的 Codex 工作，生成学生日报并展示完整预览。"
+policy:
+  allow_implicit_invocation: true

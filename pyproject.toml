@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lablog-agent"
+version = "0.1.0"
+description = "Evidence-grounded Codex work reports using the official DingTalk DWS CLI"
+requires-python = ">=3.11"
+dependencies = ["PyYAML>=6", "jsonschema>=4", "tzdata>=2024"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+lablog = "lablog.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["lablog*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
