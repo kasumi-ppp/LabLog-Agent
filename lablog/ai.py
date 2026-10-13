@@ -23,6 +23,11 @@ COMPLETION_CLAIM = re.compile(
 CHINESE_RUN = re.compile(r"[\u3400-\u9fff]+")
 ENGLISH_TOKEN = re.compile(r"[a-z0-9]{3,}")
 CHINESE_STOPWORDS = {"完成", "项目", "工作", "系统", "报告", "内容", "实现", "方法", "用户", "测试"}
+NEGATED_OR_PLANNED_PREFIX = re.compile(
+    r"(?i)(?:尚未|并未|未能|没有|未曾|未|没|计划|拟|准备|还没|还未|从未|不曾|"
+    r"并不(?:认为|表示|代表|等于|算|是|会|可能)?|不(?:认为|表示|代表|等于|是|会|可能|曾|再)|"
+    r"not(?:\s+yet)?|never|without)\s*$"
+)
 
 
 def _claim_features(text):
@@ -44,6 +49,13 @@ def _has_lexical_support(claim, source):
         return False
     # Different-language paraphrases need a person to assess semantic support in preview.
     return True
+
+
+def _asserts_completion(text):
+    for match in COMPLETION_CLAIM.finditer(text):
+        if not NEGATED_OR_PLANNED_PREFIX.search(text[:match.start()]):
+            return True
+    return False
 
 
 def validate_ai_result(result, facts):
@@ -83,7 +95,7 @@ def validate_ai_result(result, facts):
         if not cited:
             continue
         prose = re.sub(r"\[证据:[^\]]+\]", "", line)
-        if COMPLETION_CLAIM.search(prose) and any(fact_by_id[c].get("status") != "completed" for c in cited):
+        if _asserts_completion(prose) and any(fact_by_id[c].get("status") != "completed" for c in cited):
             raise ValueError("Codex summary cannot present planned evidence as completed")
     return result
 

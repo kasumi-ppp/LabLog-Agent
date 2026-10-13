@@ -433,6 +433,16 @@ def test_assisted_ai_rejects_common_deployment_completion_claims_from_planned_ev
                             "plan": "", "citations": ["p"]}, facts)
 
 
+@pytest.mark.parametrize("claim", ["尚未完成部署生产环境", "没有完成部署生产环境", "计划完成部署生产环境",
+                                   "not completed production deployment", "并不算已完成部署生产环境",
+                                   "并不认为已完成部署生产环境"])
+def test_assisted_ai_accepts_negated_or_planned_deployment_summary(claim):
+    facts = [{"evidence_id": "p", "status": "planned", "text": "计划部署生产环境"}]
+    result = validate_ai_result({"completed": "", "summary": f"{claim} [证据:p]",
+                                 "plan": "", "citations": ["p"]}, facts)
+    assert result["summary"].startswith(claim)
+
+
 def test_assisted_ai_rejects_claim_unrelated_to_its_citation():
     facts = [{"evidence_id": "x", "status": "completed", "text": "完成本地文档校验"}]
     with pytest.raises(ValueError, match="lexical support"):
