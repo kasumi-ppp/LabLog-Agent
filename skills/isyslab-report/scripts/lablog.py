@@ -27,7 +27,7 @@ def main() -> int:
     if "--config" not in arguments and mapping.get("config"):
         arguments = ["--config", mapping["config"], *arguments]
     python = mapping.get("python") or sys.executable
-    return subprocess.run([python, "-m", "lablog", *arguments], cwd=project, shell=False).returncode
+    return subprocess.run([python, "-X", "utf8", "-m", "lablog", *arguments], cwd=project, shell=False).returncode
 
 
 if __name__ == "__main__":

@@ -6,22 +6,28 @@ import argparse
 import copy
 import hashlib
 import json
+import os
 import re
+import socket
 import sys
 import unicodedata
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from . import state
 from .ai import synthesize, validate_ai_result
 from .backlog import KIND_COMPLETED, KIND_PLAN, append as backlog_append, char_count, load as backlog_load, mark_consumed, normalize_kind, stats as backlog_stats, take as backlog_take
 from .config import is_workday, load_config, resolve_path, schedule_due
+from . import doctor
 from .dws import DwsBlocked, DwsClient, DwsNoReportId, encode_contents, template_fingerprint
 from .notify import send as send_notification
 from .periods import parse_period_marker, period_labels, format_period_marker
 from .report import CITATION, FIELDS, build_draft
 from .sources import collect_codex, collect_git, collect_markdown, period_bounds
-from .workflow import SubmissionBlocked, atomic_json, atomic_text, draft_hash, file_lock, validate_submission
+from .workflow import (CorruptDocument, LockBusy, SubmissionBlocked, atomic_json, atomic_text,
+                       draft_hash, file_lock, load_json_durable, multi_lock, record_diagnostic,
+                       validate_submission)
 
 CHINA = ZoneInfo("Asia/Shanghai")
 
@@ -120,6 +126,43 @@ def _scope_list(value, key):
     return value
 
 
+def _source_report(name, role, paths, result):
+    """Describe one configured source: was it reachable, and what did it yield."""
+    resolved = [str(Path(p).expanduser()) for p in (paths or [])]
+    existing = [p for p in resolved if Path(p).exists()]
+    missing = [p for p in resolved if p not in existing]
+    return {"name": name, "role": role, "configured": bool(resolved),
+            "reachable": bool(existing) if resolved else None,
+            "scanned_paths": resolved, "missing_paths": missing,
+            "fact_count": len(result.get("facts") or []),
+            "warnings": list(result.get("warnings") or [])}
+
+
+def _evidence_write_decision(old, new, cfg):
+    """Decide whether a fresh collection may replace the stored evidence.
+
+    While any configured source is unreadable the stored evidence is never
+    allowed to shrink: an empty or thinner result then means "the source could
+    not be read", not "there was no work". A deliberate scope narrowing (every
+    source reachable, fewer or no facts) is a real result and is written.
+    """
+    if old is None:
+        return "write", "first collection for this period"
+    unreachable = [s["name"] for s in (new.get("sources") or [])
+                   if s.get("configured") and not s.get("reachable")]
+    if not unreachable:
+        return "write", "ok"
+    count_new = int(new.get("deduped_fact_count") or 0)
+    count_old = int(old.get("deduped_fact_count") if old.get("deduped_fact_count") is not None
+                    else len(old.get("facts") or []))
+    if count_new == 0:
+        return "retain", f"new collection produced no facts and {', '.join(unreachable)} unreachable"
+    if count_new < count_old:
+        return "retain", (f"fact count dropped {count_old} -> {count_new} while "
+                          f"{', '.join(unreachable)} unreachable")
+    return "write", "ok"
+
+
 def _collect(cfg, kind, day):
     codex = cfg.get("codex") or {}
     if codex.get("mode", "auto_work") not in {"auto_work", "selected"}:
@@ -132,15 +175,46 @@ def _collect(cfg, kind, day):
                             session_ids=codex.get("session_ids", []),
                             exclude_paths=codex.get("exclude_paths", []))
     supplemental = cfg.get("supplemental") or {}
-    git = collect_git([resolve_path(cfg, x) for x in supplemental.get("git_paths", [])], kind, date.fromisoformat(day))
-    md = collect_markdown([resolve_path(cfg, x) for x in supplemental.get("markdown_paths", [])], kind, date.fromisoformat(day))
+    git_paths = [resolve_path(cfg, x) for x in supplemental.get("git_paths", [])]
+    markdown_paths = [resolve_path(cfg, x) for x in supplemental.get("markdown_paths", [])]
+    git = collect_git(git_paths, kind, date.fromisoformat(day))
+    md = collect_markdown(markdown_paths, kind, date.fromisoformat(day))
     source_facts = primary["facts"] + git["facts"] + md["facts"]
     facts = _deduplicate_facts(source_facts)
+    warnings = primary["warnings"] + git["warnings"] + md["warnings"]
     result = {"kind": kind, "date": day, "facts": facts,
-              "source_fact_count": len(source_facts),
-              "warnings": primary["warnings"] + git["warnings"] + md["warnings"]}
+              "collected_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+              "collector": {"pid": os.getpid(), "host": socket.gethostname(),
+                            "scope_source": cfg.get("scope_source")},
+              "sources": [_source_report("codex", "primary", paths, primary),
+                          _source_report("git", "supplemental", git_paths, git),
+                          _source_report("markdown", "supplemental", markdown_paths, md)],
+              "source_fact_count": len(source_facts), "deduped_fact_count": len(facts),
+              "warnings": warnings,
+              "retention": {"action": "write", "reason": "ok", "previous_fact_count": None}}
     path = _path(cfg, kind, day, "evidence")
-    atomic_json(path, result)
+    old = None
+    if path.exists():
+        try:
+            old, _ = load_json_durable(path)
+        except (CorruptDocument, ValueError, OSError):
+            old = None
+    result["retention"]["previous_fact_count"] = (
+        None if old is None else int(old.get("deduped_fact_count") if old.get("deduped_fact_count") is not None
+                                     else len(old.get("facts") or [])))
+    action, reason = _evidence_write_decision(old, result, cfg)
+    result["retention"]["action"] = action
+    result["retention"]["reason"] = reason
+    if action == "retain":
+        # Keep the stored evidence byte for byte; the rejected run is recorded.
+        record_diagnostic(path, "evidence", {"event": "rejected_collection", "reason": reason,
+                                             "sources": result["sources"], "warnings": warnings})
+        kept = dict(old or {})
+        kept["retention"] = result["retention"]
+        kept["last_rejected_at"] = result["collected_at"]
+        return path, kept
+    with file_lock(path):
+        atomic_json(path, result, integrity=True, backup=True)
     return path, result
 
 
@@ -487,7 +561,36 @@ def _fill_from_backlog(cfg, kind, day, draft, evidence):
     return {"status": "filled", "origin_date": origin, **summary}
 
 
-def _generate(cfg, kind, day, engine, manual_text_file=None, hours=None, ai_result_file=None):
+PROTECTED_DRAFT_STATUSES = {"submitting", "unknown", "verified", "submitted", "mismatch"}
+
+
+def _draft_policy(cfg):
+    value = ((cfg.get("policy") or {}).get("draft_overwrite") or "snapshot")
+    return value if value in {"snapshot", "protect", "allow"} else "snapshot"
+
+
+def _archive_draft(path, prior, keep=10):
+    """Snapshot a draft that is about to be replaced so nothing is lost."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    history = path.parent / "history"
+    archive = history / f"{path.stem}.{stamp}.json"
+    atomic_json(archive, prior)
+    created = sorted(history.glob(f"{path.stem}.*.json"))
+    for stale in created[:-keep] if keep else []:
+        try:
+            stale.unlink()  # only files this helper created carry this shape
+        except OSError:
+            continue
+    return archive
+
+
+def _generate(cfg, kind, day, engine, manual_text_file=None, hours=None, ai_result_file=None, *, force=False):
+    path, draft, _info = _generate_impl(cfg, kind, day, engine, manual_text_file, hours, ai_result_file,
+                                        force=force)
+    return path, draft
+
+
+def _generate_impl(cfg, kind, day, engine, manual_text_file=None, hours=None, ai_result_file=None, *, force=False):
     path = _path(cfg, kind, day, "evidence")
     # A previously collected snapshot may have been built under a different
     # project allowlist or may omit work added later in the same day.
@@ -517,13 +620,41 @@ def _generate(cfg, kind, day, engine, manual_text_file=None, hours=None, ai_resu
     _fill_from_backlog(cfg, kind, day, draft, evidence)
     draft["hash"] = draft_hash(draft)
     draft_path = _path(cfg, kind, day, "drafts")
+    info = {"action": "written", "archive": None, "prior_hash": None}
     with file_lock(draft_path):
+        prior = None
         if draft_path.exists():
-            prior = json.loads(draft_path.read_text(encoding="utf-8"))
-            if prior.get("submission", {}).get("status") in {"submitting", "unknown", "verified", "submitted", "mismatch"}:
+            try:
+                prior, meta = load_json_durable(draft_path)
+                if meta.get("recovered"):
+                    info["recovered_from_backup"] = True
+            except (CorruptDocument, ValueError, OSError):
+                prior = None
+        if prior is not None:
+            info["prior_hash"] = prior.get("hash")
+            status = (prior.get("submission") or {}).get("status")
+            if status in PROTECTED_DRAFT_STATUSES:
                 raise SubmissionBlocked("existing draft cannot be replaced after submit attempt")
-        atomic_json(draft_path, draft)
-    return draft_path, draft
+            edited = not (bool(prior.get("hash")) and draft_hash(prior) == prior.get("hash"))
+            previewed = bool(prior.get("previewed_at"))
+            if not edited and not previewed and prior.get("hash") == draft["hash"]:
+                # Nothing changed and nobody has looked at it yet: keep the file
+                # (and its mtime) untouched so a repeated run is a real no-op.
+                info["action"] = "unchanged"
+                return draft_path, prior, info
+            policy = _draft_policy(cfg)
+            if (edited or previewed) and policy != "allow":
+                if policy == "protect" and not force:
+                    raise SubmissionBlocked(
+                        "existing draft was edited or previewed and is protected; "
+                        "re-run with --force to snapshot and replace it")
+                info["archive"] = str(_archive_draft(draft_path, prior))
+                info["action"] = "snapshot"
+            elif edited or previewed:
+                info["archive"] = str(_archive_draft(draft_path, prior))
+                info["action"] = "snapshot"
+        atomic_json(draft_path, draft, backup=True)
+    return draft_path, draft, info
 
 
 def _read_draft(path):
@@ -776,37 +907,67 @@ def _readback_matches(detail, template_id, contents, report_id=None):
     return True
 
 
+def _record_submission(state_path, path, draft, status, *, phase=None, report_id=None, error=None, reason=None):
+    """Persist an outcome: the authoritative state first, the draft mirror second.
+
+    A crash between the two writes leaves the authority ahead of the mirror,
+    which ``state.load_period`` reports instead of guessing from it.
+    """
+    state.transition(state_path, to_status=status, phase=phase, report_id=report_id,
+                     error=error, reason=reason)
+    submission = draft.setdefault("submission", {})
+    submission["status"] = status
+    if report_id is not None:
+        submission["report_id"] = report_id
+    if error is not None:
+        submission["error"] = error
+    atomic_json(path, draft)
+
+
 def _submit(cfg, path, confirm):
     path = Path(path)
     first = _read_draft(path)
     state_path = _state_path(cfg, first)
-    with file_lock(path), file_lock(state_path):
+    with multi_lock(path, state_path):
         draft = _read_draft(path)
+        record = state.load_period(state_path=state_path, draft=draft, draft_path=path)
+        if not record.can_submit:
+            raise SubmissionBlocked(state.block_reason(record))
         validate_submission(draft, confirm, {"template_fingerprint": draft.get("template_fingerprint")})
-        if state_path.exists():
-            raise SubmissionBlocked("report period already has a local submission attempt")
         client, template, users, contents = _preflight(cfg, draft)
+        contents_hash = hashlib.sha256(
+            json.dumps(contents, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        # Armed before any network call: from here on the request may be in flight,
+        # so this period is never submitted again without a remote read-back.
+        attempt = state.write_attempt(state_path, status="submitting", phase=state.PHASE_REQUEST_PENDING,
+                                      draft_path=str(path.resolve()), draft_hash=draft["hash"],
+                                      template_id=draft.get("template_id"), contents_hash=contents_hash,
+                                      reason="armed before the network call")
         draft["submission"] = {"status": "submitting", "attempted_at": datetime.now(CHINA).isoformat(),
-                               "encoded_contents": contents}
-        atomic_json(state_path, {"status": "submitting", "draft": str(path.resolve()), "hash": draft["hash"]})
+                               "attempt_id": attempt["attempt_id"], "encoded_contents": contents}
         atomic_json(path, draft)
         try:
             try:
                 report_id = client.submit(draft["template_id"], contents, users)
             except DwsNoReportId:
                 report_id = _resolve_created_report(cfg, client, draft["template_name"], draft)
+            if report_id:
+                state.transition(state_path, phase=state.PHASE_ID_CONFIRMED, report_id=report_id,
+                                 reason="report id resolved")
+                draft["submission"]["report_id"] = report_id
+                atomic_json(path, draft)
             if not report_id:
-                raise SubmissionBlocked("submitted but the created report could not be resolved from the outbox")
-            draft["submission"]["report_id"] = report_id
+                reason = "submitted but the created report could not be resolved from the outbox"
+                _record_submission(state_path, path, draft, "unknown", error=reason, reason=reason)
+                raise SubmissionBlocked(reason)
             detail = client.detail(report_id)
             if not _readback_matches(detail, draft["template_id"], contents, report_id):
-                draft["submission"]["status"] = "mismatch"
-                atomic_json(path, draft)
-                atomic_json(state_path, {"status": "mismatch", "draft": str(path.resolve()), "report_id": report_id})
-                raise SubmissionBlocked("readback field mismatch or unsupported detail shape")
-            draft["submission"]["status"] = "verified"
-            atomic_json(path, draft)
-            atomic_json(state_path, {"status": "verified", "draft": str(path.resolve()), "report_id": report_id})
+                reason = "readback field mismatch or unsupported detail shape"
+                _record_submission(state_path, path, draft, "mismatch", phase=state.PHASE_READBACK_MISMATCH,
+                                   report_id=report_id, error=reason, reason=reason)
+                raise SubmissionBlocked(reason)
+            _record_submission(state_path, path, draft, "verified", phase=state.PHASE_COMPLETED,
+                               report_id=report_id, reason="remote read-back matched")
             # Only a verified submission consumes backlog prose. An unknown or
             # mismatched outcome must keep it so it can be resubmitted later.
             filled = (draft.get("carryover") or {}).get("filled_items") or []
@@ -816,36 +977,64 @@ def _submit(cfg, path, confirm):
                     draft["carryover"]["consumed_items"] = consumed
                     atomic_json(path, draft)
         except BaseException as exc:
-            if draft["submission"]["status"] == "submitting":
-                draft["submission"]["status"] = "unknown"
-                draft["submission"]["error"] = type(exc).__name__
-                atomic_json(path, draft)
-                atomic_json(state_path, {"status": "unknown", "draft": str(path.resolve()),
-                                         "report_id": draft["submission"].get("report_id")})
+            if draft.get("submission", {}).get("status") == "submitting":
+                _record_submission(state_path, path, draft, "unknown",
+                                   error=f"{type(exc).__name__}: {exc}",
+                                   reason="interrupted before the outcome was known")
             raise
     return {"status": draft["submission"]["status"], "report_id": draft["submission"]["report_id"],
+            "attempt_id": attempt["attempt_id"], "phase": state.PHASE_COMPLETED,
             "backlog_consumed": (draft.get("carryover") or {}).get("consumed_items", 0), "draft": str(path)}
 
 
 def _reconcile(cfg, path):
+    """Resolve an interrupted or mismatched attempt by reading the remote only.
+
+    Never sends anything. A period is only ever marked verified when the remote
+    read-back matches the encoded contents of this very attempt.
+    """
     path = Path(path)
-    with file_lock(path):
+    draft = _read_draft(path)
+    state_path = _state_path(cfg, draft)
+    with multi_lock(path, state_path):
         draft = _read_draft(path)
-        status = draft.get("submission", {}).get("status")
-        if status not in {"unknown", "mismatch", "submitting"}:
-            return {"status": status or "not_submitted", "draft": str(path)}
+        record = state.load_period(state_path=state_path, draft=draft, draft_path=path)
+        status = record.status
+        if status not in state.UNRESOLVED:
+            if record.inconsistency == "mirror_lagging":
+                # The authority is ahead of the draft: repair forward only.
+                submission = draft.setdefault("submission", {})
+                submission["status"] = status
+                if record.report_id:
+                    submission["report_id"] = record.report_id
+                atomic_json(path, draft)
+            return {"status": status or "not_submitted", "draft": str(path),
+                    "attempt_id": record.attempt_id}
         client = _client(cfg)
-        submission = draft["submission"]
-        report_id = submission.get("report_id")
+        submission = draft.setdefault("submission", {})
+        report_id = record.report_id or submission.get("report_id")
         if draft.get("approval_context") != _approval_context(cfg, draft["kind"], draft["date"]):
-            return {"status": "manual_review_required", "draft": str(path), "reason": "Identity or approval context changed since submission."}
+            return {"status": "manual_review_required", "draft": str(path),
+                    "attempt_id": record.attempt_id,
+                    "reason": "Identity or approval context changed since submission."}
         try:
             auth = client.auth()
         except DwsBlocked as exc:
             return {"status": "manual_review_required", "draft": str(path), "reason": str(exc)}
         identity = cfg.get("identity") or {}
         if auth.get("corp_id") != identity.get("corp_id") or auth.get("user_id") != identity.get("user_id"):
-            return {"status": "manual_review_required", "draft": str(path), "reason": "Current account differs from the approved account."}
+            return {"status": "manual_review_required", "draft": str(path),
+                    "reason": "Current account differs from the approved account."}
+        if not report_id:
+            # The id may simply never have been recorded; look it up read-only.
+            resolved = _resolve_created_report(cfg, client, draft["template_name"], draft)
+            if resolved:
+                report_id = resolved
+                state.transition(state_path, phase=state.PHASE_ID_CONFIRMED, report_id=report_id,
+                                 reason="resolved from the outbox during reconcile")
+                submission["report_id"] = report_id
+                submission.setdefault("status", record.status)
+                atomic_json(path, draft)
         if report_id:
             try:
                 client, _, _, approved_contents = _preflight(cfg, draft, duplicate_check=False)
@@ -854,18 +1043,46 @@ def _reconcile(cfg, path):
                 return {"status": "manual_review_required", "draft": str(path), "reason": str(exc)}
             if _readback_matches(detail, draft["template_id"], approved_contents, report_id):
                 submission["status"] = "verified"
+                submission["report_id"] = report_id
                 atomic_json(path, draft)
-                state_path = _state_path(cfg, draft)
-                with file_lock(state_path):
-                    atomic_json(state_path, {"status": "verified", "draft": str(path.resolve()), "report_id": report_id})
-                return {"status": "verified", "report_id": report_id, "draft": str(path)}
+                state.transition(state_path, to_status="verified", phase=state.PHASE_COMPLETED,
+                                 report_id=report_id, reason="remote read-back matched during reconcile")
+                filled = (draft.get("carryover") or {}).get("filled_items") or []
+                if filled:
+                    consumed = mark_consumed(cfg, filled, draft["date"], str(report_id))
+                    if consumed:
+                        draft["carryover"]["consumed_items"] = consumed
+                        atomic_json(path, draft)
+                return {"status": "verified", "report_id": report_id, "draft": str(path),
+                        "attempt_id": record.attempt_id, "resolved": "remote_readback"}
         reports = _outbox_history(cfg, client, draft["template_name"], draft["date"], draft["kind"])
         return {"status": "manual_review_required", "remote_count": len(reports), "draft": str(path),
+                "attempt_id": record.attempt_id, "phase": record.phase,
                 "reason": "Unknown attempts are never retried automatically; inspect remote report and reconcile manually."}
+
+
+def _mark_previewed(path, draft):
+    """Record that a person has seen this draft.
+
+    ``previewed_at`` and ``preview_count`` are excluded from ``draft_hash``, so
+    marking a previewed draft never invalidates a confirmation hash.
+    """
+    stamp = datetime.now(CHINA).isoformat()
+    with file_lock(path):
+        try:
+            current, _ = load_json_durable(Path(path))
+        except (CorruptDocument, ValueError, OSError):
+            current = dict(draft)
+        if not current.get("previewed_at"):
+            current["previewed_at"] = stamp
+        current["preview_count"] = int(current.get("preview_count") or 0) + 1
+        atomic_json(path, current, backup=True)
+    return current
 
 
 def _preview(cfg, path):
     draft = _read_draft(path)
+    draft = _mark_previewed(Path(path), draft)
     duplicate = {"status": "unknown"}
     try:
         found = _has_period_duplicate(cfg, _client(cfg), draft["template_name"], draft)
@@ -897,7 +1114,12 @@ NOTIFY_STATUSES = {"blocked", "error", "unknown", "mismatch"}
 
 
 def _notify_outcome(cfg, outcome):
-    """Mail the stop reason of an unattended run. Never masks the outcome."""
+    """Mail the stop reason of an unattended run. Never masks the outcome.
+
+    The alert is written to disk *before* it is mailed: when the token has
+    expired the mail itself cannot be delivered, and the alert must still be
+    there for a person (or ``doctor --resend-alerts``) to pick up later.
+    """
     if outcome.get("status") not in NOTIFY_STATUSES:
         return outcome
     lines = ["LabLog-Agent 自动执行未完成，需要你处理。", "",
@@ -913,11 +1135,20 @@ def _notify_outcome(cfg, outcome):
               "- 认证失效(token_refresh_failed): 执行 dws auth login 重新扫码授权",
               "- 无完成证据(no dated completion evidence): 补当日工作记录后重跑",
               "- 查重异常/读回不一致: 先 dws report +outbox-list 人工核对，切勿重试提交"]
+    if outcome.get("status") in {"blocked", "error"} and "auth" in str(outcome.get("reason", "")).lower():
+        lines += ["- 若你是下班后/未登录时收到此信：重新登录 Windows 会话后执行 "
+                  "`dws auth login` 重新授权，再手动跑一次 auto"]
+    alert = state.record_alert(cfg, f"{outcome['date']}-{outcome['status']}", "\n".join(lines))
+    outcome["alert_file"] = str(alert)
     try:
         outcome["notified"] = send_notification(
             cfg, f"[LabLog] 日报自动执行未完成 {outcome['date']} {outcome['status']}", "\n".join(lines))
     except Exception as exc:  # notification is a side channel; never break the run
         outcome["notified"] = {"status": "failed", "reason": type(exc).__name__}
+    if (outcome.get("notified") or {}).get("status") == "sent":
+        outcome["alert_delivered"] = bool(state.consume_alerts(cfg, [alert]))
+    else:
+        outcome["alert_delivered"] = False
     return outcome
 
 
@@ -940,6 +1171,11 @@ def _auto(cfg, kind, day, engine, *, submit=False, manual_text_file=None, hours=
         outcome.update(extra)
         return _notify_outcome(cfg, outcome)
 
+    # A heartbeat is what lets a later run notice that this one never happened
+    # (machine off, nobody logged in, task skipped).
+    beat = state.heartbeat_start(cfg, f"auto-{kind}", kind=kind)
+    outcome["run_id"] = beat["run_id"]
+
     try:
         if kind == "daily" and not is_workday(cfg, date.fromisoformat(day)):
             steps.append({"step": "workday_gate", "status": "not_due"})
@@ -955,15 +1191,45 @@ def _auto(cfg, kind, day, engine, *, submit=False, manual_text_file=None, hours=
                 prior = json.loads(existing.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 prior = {}
-            prior_status = (prior.get("submission") or {}).get("status")
-            if prior_status in {"submitting", "unknown", "verified", "submitted", "mismatch"}:
+            try:
+                state_path = _state_path(cfg, prior) if prior else None
+            except (KeyError, ValueError, TypeError):
+                state_path = None
+            record = state.load_period(state_path=state_path, draft=prior or None, draft_path=existing)
+            prior_status = record.status
+            if prior_status in state.TERMINAL:
                 steps.append({"step": "idempotency", "status": prior_status})
-                # unknown/mismatch still need a human, so they keep an alarming status
-                # and mail; a verified period is simply done, and stays quiet.
-                outcome.update({"status": prior_status if prior_status in {"unknown", "mismatch"} else "already_submitted",
+                outcome.update({"status": "already_submitted",
                                 "reason": f"this work period already has a local submission attempt ({prior_status})",
-                                "draft": str(existing),
-                                "report_id": (prior.get("submission") or {}).get("report_id")})
+                                "draft": str(existing), "report_id": record.report_id})
+                return outcome
+            if prior_status in {"unknown", "mismatch"} or not record.consistent:
+                # A human has to inspect the remote report; never retry, never mail quietly.
+                steps.append({"step": "idempotency", "status": prior_status or "inconsistent"})
+                outcome.update({"status": prior_status or "manual_review_required",
+                                "reason": (state.block_reason(record) if not record.consistent
+                                           else f"this work period already has a local submission attempt ({prior_status})"),
+                                "draft": str(existing), "report_id": record.report_id,
+                                "attempt_id": record.attempt_id, "phase": record.phase})
+                return _notify_outcome(cfg, outcome)
+            if prior_status == "submitting":
+                # Interrupted mid-flight: probe the remote read-only. A verified
+                # read-back closes the attempt; anything else stays for a human.
+                steps.append({"step": "idempotency", "status": "submitting"})
+                try:
+                    probe = _reconcile(cfg, existing)
+                except (DwsBlocked, SubmissionBlocked, OSError, ValueError, KeyError) as exc:
+                    probe = {"status": "manual_review_required", "reason": f"{type(exc).__name__}: {exc}"}
+                steps.append({"step": "reconcile", "status": probe.get("status")})
+                if probe.get("status") == "verified":
+                    outcome.update({"status": "verified", "auto_submitted": False,
+                                    "report_id": probe.get("report_id"), "draft": str(existing),
+                                    "reason": "an interrupted attempt was confirmed by remote read-back"})
+                    return outcome
+                outcome.update({"status": probe.get("status") or "unknown",
+                                "reason": probe.get("reason") or "an interrupted submission attempt could not be confirmed remotely",
+                                "draft": str(existing), "report_id": probe.get("report_id"),
+                                "attempt_id": record.attempt_id, "phase": record.phase})
                 return _notify_outcome(cfg, outcome)
 
         client = _client(cfg)
@@ -1027,6 +1293,10 @@ def _auto(cfg, kind, day, engine, *, submit=False, manual_text_file=None, hours=
         outcome.update({"status": result["status"], "report_id": result.get("report_id"), **extra})
         outcome["auto_submitted"] = result["status"] == "verified"
         return _notify_outcome(cfg, outcome) if result["status"] != "verified" else outcome
+    except LockBusy as exc:
+        # Another run owns the period; it will report for itself. Staying quiet
+        # here is what keeps an every-workday schedule usable.
+        return stop("busy", f"another run holds the lock for this period: {exc}")
     except (OSError, ValueError, KeyError, SubmissionBlocked, DwsBlocked) as exc:
         reason = f"{type(exc).__name__}: {exc}"
         # ``_submit`` records the terminal state before raising; surface it instead
@@ -1039,6 +1309,11 @@ def _auto(cfg, kind, day, engine, *, submit=False, manual_text_file=None, hours=
                 recorded = None
         status = recorded if recorded in {"unknown", "mismatch"} else "error"
         return stop(status, reason, draft=str(draft_path) if draft_path else None)
+    finally:
+        try:
+            state.heartbeat_finish(cfg, f"auto-{kind}", outcome.get("status"), run_id=outcome["run_id"])
+        except Exception:  # the heartbeat is diagnostic; it must not mask an outcome
+            pass
 
 
 def _backlog_command(cfg, args):
@@ -1069,11 +1344,32 @@ def _backlog_command(cfg, args):
     return {"status": "ok", "stats": backlog_stats(cfg), "items": items}
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _config_path(value):
+    """Resolve ``--config`` against the project root.
+
+    A relative path must never depend on the current working directory: the same
+    command started from another shell or by the task scheduler has to reach the
+    same configuration and therefore the same data directory.
+    """
+    if not value:
+        return PROJECT_ROOT / "config" / "config.local.yaml"
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="lablog")
-    parser.add_argument("--config", default="config/config.local.yaml")
+    parser.add_argument("--config", default=None)
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("doctor")
+    check = sub.add_parser("doctor")
+    check.add_argument("--check-schedule", action="store_true",
+                       help="report workdays with no completed run")
+    check.add_argument("--days", type=int, default=7)
+    check.add_argument("--resend-alerts", action="store_true",
+                       help="retry alerts that could not be mailed")
     for command in ("collect", "generate", "scheduled"):
         item = sub.add_parser(command)
         item.add_argument("--kind", choices=("daily", "weekly", "monthly"), required=True)
@@ -1083,6 +1379,8 @@ def main(argv=None):
             item.add_argument("--ai-result-file")
             item.add_argument("--manual-text-file")
             item.add_argument("--hours")
+            item.add_argument("--force", action="store_true",
+                              help="snapshot and replace a draft that was edited or previewed")
         if command in ("collect", "generate"):
             item.add_argument("--scope-file")
     auto = sub.add_parser("auto")
@@ -1105,8 +1403,9 @@ def main(argv=None):
         if command == "submit":
             item.add_argument("--confirm-hash", required=True)
     args = parser.parse_args(argv)
+    config_path = _config_path(args.config)
     try:
-        cfg = load_config(args.config)
+        cfg = load_config(config_path)
         if args.command == "doctor":
             client = _client(cfg)
             auth = client.auth()
@@ -1126,18 +1425,32 @@ def main(argv=None):
                 blockers.append("date encoding unverified for daily submission")
             if not cfg.get("history_from"):
                 blockers.append("history_from missing for duplicate guard")
+            local = doctor.collect(cfg)
+            if getattr(args, "check_schedule", False):
+                local["schedule"] = doctor.missed_runs(cfg, days=getattr(args, "days", 7))
+                if local["schedule"]["missing"]:
+                    blockers.append("workdays with no completed run: "
+                                    + ", ".join(local["schedule"]["missing"]))
+            if getattr(args, "resend_alerts", False):
+                local["resent_alerts"] = doctor.resend_alerts(cfg, send_notification)
             result = {"status": "blocked" if blockers else "ok", "authenticated": True,
                       "identity_matches": identity_ok, "templates": template_info,
-                      "recipients": recipient_results, "submission_blockers": blockers}
+                      "recipients": recipient_results, "submission_blockers": blockers,
+                      "local": local}
         elif args.command == "collect":
             path, evidence = _collect(_apply_scope(cfg, args.scope_file), args.kind, date.fromisoformat(args.date).isoformat())
             result = {"status": "collected", "path": str(path), "fact_count": len(evidence["facts"]), "warnings": evidence["warnings"]}
         elif args.command == "backlog":
             result = _backlog_command(cfg, args)
         elif args.command == "generate":
-            path, draft = _generate(_apply_scope(cfg, args.scope_file), args.kind, date.fromisoformat(args.date).isoformat(), args.engine,
-                                    args.manual_text_file, args.hours, args.ai_result_file)
-            result = {"status": "drafted", "path": str(path), "hash": draft["hash"], "blockers": draft["blockers"], "engine": draft["generation_engine"]}
+            scoped = _apply_scope(cfg, args.scope_file)
+            path, draft, gen_info = _generate_impl(scoped, args.kind, date.fromisoformat(args.date).isoformat(),
+                                                   args.engine, args.manual_text_file, args.hours,
+                                                   args.ai_result_file, force=args.force)
+            result = {"status": "drafted", "path": str(path), "hash": draft["hash"], "blockers": draft["blockers"],
+                      "engine": draft["generation_engine"], "draft_action": gen_info["action"],
+                      "draft_archive": gen_info.get("archive"), "data_dir": str(resolve_path(scoped, scoped.get("data_dir", "data"))),
+                      "config": str(config_path)}
         elif args.command == "scheduled":
             day = date.fromisoformat(args.date)
             due = schedule_due(cfg, args.kind, day)
@@ -1175,9 +1488,23 @@ def main(argv=None):
             result = _submit(cfg, args.draft, args.confirm_hash)
         else:
             result = _reconcile(cfg, args.draft)
+        if isinstance(result, dict):
+            # Make the directories actually used visible in every run: a report
+            # written to an unexpected data directory must be obvious, not a
+            # mystery "my drafts disappeared".
+            result.setdefault("data_dir", str(resolve_path(cfg, cfg.get("data_dir", "data"))))
+            result.setdefault("config", str(config_path))
         print(json.dumps(result, ensure_ascii=True, default=str))
         failed = result.get("status") in {"blocked", "error", "unknown", "mismatch", "manual_review_required"}
         return 2 if failed else 0
+    except LockBusy as exc:
+        payload = {"status": "busy", "error": str(exc), "config": str(config_path)}
+        try:
+            payload["data_dir"] = str(resolve_path(cfg, cfg.get("data_dir", "data")))
+        except Exception:
+            pass
+        print(json.dumps(payload, ensure_ascii=True), file=sys.stdout)
+        return 2
     except (OSError, ValueError, KeyError, SubmissionBlocked, DwsBlocked) as exc:
         print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=True), file=sys.stdout)
         return 2

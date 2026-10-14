@@ -23,6 +23,10 @@ foreach ($taskKind in @('daily','weekly','monthly')) {
     $taskTimeProperty = "${taskKind}_time"
     if ($taskSchedule.$taskTimeProperty -notmatch '^([01]\d|2[0-3]):[0-5]\d$') { throw "Missing or invalid schedule.$taskTimeProperty" }
 }
+# Interactive logon is kept on purpose: an unattended run cannot reach a user
+# session anyway. Missed runs (machine off, nobody logged in) and expired DWS
+# tokens are surfaced afterwards by `scripts/check-heartbeat.ps1`
+# (doctor --check-schedule / --resend-alerts), which mails the operator.
 $taskPrincipal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited
 $taskSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
 foreach ($taskKind in @('daily','weekly','monthly')) {
