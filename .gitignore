@@ -3,11 +3,22 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 .venv/
-data/
-config/*.local.*
+# Evidence, drafts, previews and receipts for every data_dir variant
+# (data, data-auto, data-vr, data-vr-fix, ...). These hold raw Codex session
+# text, real reports and local filesystem paths -- never publish them.
+data*/
 .env
 **/runtime.local.json
 .superpowers/
 work-records/private/
 dist/
 build/
+# Local agent scratch dirs
+.tmp/
+.workbuddy/
+# Working configs that carry real identity, recipient IDs and mailboxes.
+# Copy config/config.example.yaml and fill them in locally instead.
+config/config.local.yaml
+config/config.auto.yaml
+config/config.vr.yaml
+config/config.vr-fix.yaml

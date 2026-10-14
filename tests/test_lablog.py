@@ -89,6 +89,29 @@ def test_daily_manual_quote_is_verbatim_and_hours_unset():
     assert fields["工作日期"] == "2026-10-13"
 
 
+def test_reader_body_strips_traceability_marks_into_draft_citations():
+    template = {"report_template_id": "t", "report_template_fields": [
+        {"field_name": "今日完成", "field_sort": 0, "field_type": 1},
+        {"field_name": "心得体会", "field_sort": 1, "field_type": 1}]}
+    evidence = {"facts": [{"evidence_id": "abc", "source": "git", "status": "committed",
+                           "text": "Fix parser", "time": "2026-10-13T09:00:00+08:00"}]}
+    ai_result = {"completed": "- 修复解析器 [证据:abc]", "summary": "今日修复解析器 [证据:abc]",
+                 "plan": "", "citations": ["abc"]}
+    draft = build_draft("daily", "2026-10-13", template, evidence, ai_result=ai_result)
+    fields = {x["name"]: x["value"] for x in draft["fields"]}
+    assert "[证据:" not in fields["今日完成"]
+    assert "[证据:" not in fields["心得体会"]
+    assert "修复解析器" in fields["今日完成"]
+    assert draft["citations"] == {"今日完成": ["abc"], "心得体会": ["abc"]}
+
+    codex_fact = {"evidence_id": "c1", "source": "codex", "status": "completed",
+                  "text": "Done thing", "time": "2026-10-13T10:00:00+08:00"}
+    extractive = build_draft("daily", "2026-10-13", template, {"facts": [codex_fact]})
+    body = {x["name"]: x["value"] for x in extractive["fields"]}["今日完成"]
+    assert "Done thing" in body
+    assert "未独立核验" not in body and "[证据:" not in body
+
+
 def test_selected_project_mode_without_session_id_is_allowed(tmp_path, monkeypatch):
     from lablog.cli import _collect
     cfg = {"_base": str(tmp_path), "data_dir": "data", "codex": {
@@ -578,3 +601,474 @@ def test_git_collection_warns_when_commit_limit_is_reached(tmp_path, monkeypatch
     result = sources.collect_git([tmp_path], "daily", date(2026, 10, 13))
     assert len(result["facts"]) == 200
     assert any("git commit limit reached" in warning for warning in result["warnings"])
+
+
+def _auto_config(tmp_path, *, holidays=(), makeup=()):
+    from lablog.workflow import atomic_json
+    cal = tmp_path / "cal.json"
+    cal.write_text(json.dumps({"year": 2026, "source": "official",
+                               "holidays": list(holidays), "makeup_workdays": list(makeup)}), encoding="utf-8")
+    return {"_base": str(tmp_path), "data_dir": "data", "calendar": {"file": "cal.json"},
+            "dws": {"executable": "dws", "profile": "p"},
+            "identity": {"corp_id": "corp", "user_id": "self", "corp_name": "lab", "user_name": "Self"},
+            "recipients": [{"name": "Recipient", "user_id": "r", "corp_name": "lab"}],
+            "templates": {"daily": {"id": "t", "name": "学生日报"}},
+            "date_encoding": {"verified": True, "format": "iso-date"},
+            "history_from": "2026-10-01",
+            "notify": {"enabled": True, "from": "a@dingtalk.com", "to": ["operator@example.com"]}}
+
+
+def test_auto_skips_non_workday_without_touching_dws_or_mail(tmp_path, monkeypatch):
+    import lablog.cli as cli
+    cfg = _auto_config(tmp_path, holidays=["2026-10-13"])
+    sent = []
+    monkeypatch.setattr(cli, "_client", lambda config: pytest.fail("DWS must not be touched"))
+    monkeypatch.setattr(cli, "send_notification", lambda *a, **k: sent.append(a) or {"status": "sent"})
+    result = cli._auto(cfg, "daily", "2026-10-13", "extractive", submit=True)
+    assert result["status"] == "not_due"
+    assert result["auto_submitted"] is False
+    assert sent == []
+
+
+def test_auto_mails_operator_and_never_submits_without_auth(tmp_path, monkeypatch):
+    import lablog.cli as cli
+
+    class FakeDws:
+        def auth(self):
+            raise DwsBlocked("DWS authentication unavailable")
+
+    cfg = _auto_config(tmp_path)
+    monkeypatch.setattr(cli, "_client", lambda config: FakeDws())
+    sent = []
+    monkeypatch.setattr(cli, "send_notification",
+                        lambda _cfg, subject, body: sent.append((subject, body)) or {"status": "sent"})
+    result = cli._auto(cfg, "daily", "2026-10-13", "extractive", submit=True)
+    assert result["status"] == "blocked"
+    assert result["auto_submitted"] is False
+    assert len(sent) == 1 and "2026-10-13" in sent[0][0]
+    assert "authentication" in sent[0][1]
+
+
+def test_auto_stops_on_draft_blockers_before_dry_run(tmp_path, monkeypatch):
+    import lablog.cli as cli
+    from lablog.workflow import atomic_json
+
+    class FakeDws:
+        submits = 0
+        def auth(self):
+            return {"corp_id": "corp", "user_id": "self", "user_name": "Self"}
+        def contact(self, ident):
+            return {"orgUserName": "Recipient", "orgName": "lab"}
+        def outbox(self, name, start, end):
+            return []
+        def submit(self, *args, **kwargs):
+            self.submits += 1
+            return {}
+
+    cfg = _auto_config(tmp_path)
+    draft = freeze_draft({"kind": "daily", "date": "2026-10-13", "template_id": "t",
+                          "template_name": "学生日报", "template_fingerprint": "f", "fields": [],
+                          "blockers": ["no dated completion evidence"]})
+    path = tmp_path / "draft.json"
+    atomic_json(path, draft)
+    fake = FakeDws()
+    monkeypatch.setattr(cli, "_client", lambda config: fake)
+    monkeypatch.setattr(cli, "_generate", lambda *a, **k: (path, draft))
+    monkeypatch.setattr(cli, "send_notification", lambda *a, **k: {"status": "sent"})
+    result = cli._auto(cfg, "daily", "2026-10-13", "extractive", submit=True)
+    assert result["status"] == "blocked"
+    assert "no dated completion evidence" in result["reason"]
+    assert fake.submits == 0
+
+
+def test_auto_is_idempotent_after_a_verified_period(tmp_path, monkeypatch):
+    import lablog.cli as cli
+    from lablog.workflow import atomic_json
+    cfg = _auto_config(tmp_path)
+    draft = freeze_draft({"kind": "daily", "date": "2026-10-13", "template_id": "t",
+                          "template_name": "学生日报", "template_fingerprint": "f", "fields": [],
+                          "blockers": []})
+    draft["submission"] = {"status": "verified", "report_id": "report-1"}
+    path = tmp_path / "data" / "drafts" / "daily-2026-10-13.json"
+    atomic_json(path, draft)
+    sent = []
+    monkeypatch.setattr(cli, "_client", lambda config: pytest.fail("must not touch DWS"))
+    monkeypatch.setattr(cli, "send_notification", lambda *a, **k: sent.append(a) or {"status": "sent"})
+    result = cli._auto(cfg, "daily", "2026-10-13", "extractive", submit=True)
+    assert result["status"] == "already_submitted"
+    assert result["report_id"] == "report-1"
+    assert result["auto_submitted"] is False
+    assert sent == []
+
+
+def test_auto_stays_quiet_when_the_period_already_exists_remotely(tmp_path, monkeypatch):
+    """A period that is already on the server is done, not a failure to report.
+
+    Otherwise an every-workday schedule would mail the operator a false alarm
+    each evening the report had already been filed by hand.
+    """
+    import lablog.cli as cli
+    from lablog.workflow import atomic_json
+
+    class FakeDws:
+        submits = 0
+
+        def auth(self):
+            return {"corp_id": "corp", "user_id": "self", "user_name": "Self"}
+
+        def contact(self, ident):
+            return {"orgUserName": "Recipient", "orgName": "lab"}
+
+        def outbox(self, name, start, end):
+            return [{"reportId": "existing", "createTime": 1}]
+
+        def detail(self, report_id):
+            return {"report_content": [{"key": "今日完成",
+                                        "value": "统计周期：2026-10-13 至 2026-10-13\n"}]}
+
+        def submit(self, *args, **kwargs):
+            self.submits += 1
+            return {}
+
+    cfg = _auto_config(tmp_path)
+    draft = freeze_draft({"kind": "daily", "date": "2026-10-13", "template_id": "t",
+                          "template_name": "学生日报", "template_fingerprint": "f", "fields": [],
+                          "blockers": []})
+    path = tmp_path / "draft.json"
+    atomic_json(path, draft)
+    fake = FakeDws()
+    monkeypatch.setattr(cli, "_client", lambda config: fake)
+    monkeypatch.setattr(cli, "_generate", lambda *a, **k: (path, draft))
+    sent = []
+    monkeypatch.setattr(cli, "send_notification", lambda *a, **k: sent.append(a) or {"status": "sent"})
+    result = cli._auto(cfg, "daily", "2026-10-13", "extractive", submit=True)
+    assert result["status"] == "already_submitted"
+    assert result["auto_submitted"] is False
+    assert fake.submits == 0
+    assert sent == []
+
+
+def test_scope_file_overrides_only_the_keys_it_names(tmp_path):
+    import lablog.cli as cli
+    cfg = {"codex": {"mode": "auto_work", "project_paths": ["E:/old"], "session_ids": ["s1"]},
+           "supplemental": {"git_paths": ["E:/git"], "markdown_paths": ["E:/md"]}}
+    scope = tmp_path / "scope.json"
+    scope.write_text(json.dumps({"project_paths": ["E:/project/VR"]}), encoding="utf-8")
+    scoped = cli._apply_scope(cfg, str(scope))
+    assert scoped["codex"]["project_paths"] == ["E:/project/VR"]
+    assert scoped["codex"]["mode"] == "selected"
+    assert scoped["codex"]["session_ids"] == ["s1"]
+    assert scoped["supplemental"]["git_paths"] == ["E:/git"]
+    assert scoped["supplemental"]["markdown_paths"] == ["E:/md"]
+    assert cfg["codex"]["project_paths"] == ["E:/old"]
+    assert scoped["scope_source"].endswith("scope.json")
+
+
+def test_scope_file_rejects_unknown_keys_and_bad_types(tmp_path):
+    import lablog.cli as cli
+    cfg = {"codex": {}, "supplemental": {}}
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"project_path": ["E:/x"]}), encoding="utf-8")
+    with pytest.raises(ValueError, match="unknown scope keys"):
+        cli._apply_scope(cfg, str(bad))
+    bad.write_text(json.dumps({"project_paths": "E:/x"}), encoding="utf-8")
+    with pytest.raises(ValueError, match="list of strings"):
+        cli._apply_scope(cfg, str(bad))
+    bad.write_text(json.dumps(["E:/x"]), encoding="utf-8")
+    with pytest.raises(ValueError, match="JSON object"):
+        cli._apply_scope(cfg, str(bad))
+    assert cli._apply_scope(cfg, None) is cfg
+
+
+def test_auto_records_the_scope_source_in_its_outcome(tmp_path, monkeypatch):
+    import lablog.cli as cli
+    cfg = _auto_config(tmp_path)
+    cfg["codex"] = {"mode": "auto_work", "project_paths": []}
+    cfg["supplemental"] = {}
+    scope = tmp_path / "scope.json"
+    scope.write_text(json.dumps({"project_paths": ["E:/project/VR"]}), encoding="utf-8")
+    monkeypatch.setattr(cli, "_client", lambda config: pytest.fail("non-workday gate must run first"))
+    result = cli._auto(cfg, "daily", "2026-10-11", "extractive", scope_file=str(scope))
+    assert result["status"] == "not_due"
+    assert result["scope_source"].endswith("scope.json")
+
+
+def test_notify_is_disabled_by_default_and_targets_every_recipient(monkeypatch):
+    from lablog import notify as notify_module
+    cfg = {"dws": {"executable": "dws", "profile": "p"},
+           "notify": {"enabled": False, "from": "a@dingtalk.com", "to": ["operator@example.com"]}}
+    assert notify_module.send(cfg, "s", "b")["status"] == "disabled"
+
+    seen = {}
+
+    class Proc:
+        returncode = 0
+        stdout = '{"success": "true"}'
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        return Proc()
+
+    monkeypatch.setattr(notify_module.subprocess, "run", fake_run)
+    cfg["notify"]["enabled"] = True
+    cfg["notify"]["to"] = ["operator@example.com", "1qg-0pnyng6neq@dingtalk.com"]
+    assert notify_module.send(cfg, "s", "b")["status"] == "sent"
+    argv = seen["argv"]
+    assert argv[-1] == "b"
+    assert "operator@example.com,1qg-0pnyng6neq@dingtalk.com" in argv
+    assert "mail" in argv and "send" in argv
+
+
+# ---------------------------------------------------------------------------
+# Carryover backlog: staging, theme-complete trimming and backfill
+# ---------------------------------------------------------------------------
+
+def _carryover_cfg(tmp_path, *, enabled=True, target=200, plan_extra=True, apply_to=("completed",)):
+    """A minimal cfg plus the carryover block, mirroring load_config defaults."""
+    return {"_base": str(tmp_path), "data_dir": "data",
+            "quality": {"carryover": {"enabled": enabled, "target_chars": target,
+                                      "apply_to": list(apply_to), "plan_extra": plan_extra}}}
+
+
+def _daily_draft(marker, body, *, plan=None, citations=None):
+    fields = [{"name": "今日完成", "type": 1, "sort": 0, "value": marker + "\n" + body}]
+    if plan is not None:
+        fields.append({"name": "明日计划", "type": 1, "sort": 2, "value": plan})
+    return {"kind": "daily", "date": "2026-10-13", "fields": fields, "blockers": [],
+            "warnings": [], "citations": citations or {}, "generation_engine": "extractive"}
+
+
+def test_backlog_append_is_idempotent_by_content(tmp_path):
+    from lablog import backlog
+    cfg = _carryover_cfg(tmp_path)
+    item = {"text": "完成了解析器重构。", "created_date": "2026-10-13",
+            "source": "codex-assisted", "evidence_ids": ["e1"]}
+    assert backlog.append(cfg, [item]) == 1
+    assert backlog.append(cfg, [dict(item)]) == 0
+    assert len(backlog.load(cfg)["items"]) == 1
+
+
+def test_backlog_take_is_fifo_truncating_and_reports_remaining(tmp_path):
+    from lablog import backlog
+    cfg = _carryover_cfg(tmp_path)
+    backlog.append(cfg, [
+        {"text": "aaaa", "created_date": "2026-10-10"},
+        {"text": "bbbb", "created_date": "2026-10-11"},
+        {"text": "ccccc", "created_date": "2026-10-12"},
+    ])
+    selected, total, remaining = backlog.take(cfg, 100)
+    assert [x["text"] for x in selected] == ["aaaa", "bbbb", "ccccc"]  # FIFO
+    assert total == 13 and remaining == 0
+
+    selected, total, remaining = backlog.take(cfg, 4)
+    assert [x["text"] for x in selected] == ["aaaa"]  # truncates to the limit
+    assert total == 4 and remaining == 2
+
+    # A single item larger than the limit is still returned (at least one).
+    selected, _, _ = backlog.take(cfg, 1)
+    assert [x["text"] for x in selected] == ["aaaa"]
+
+    # The remaining count is measured after applying the date filter.
+    selected, _, remaining = backlog.take(cfg, 100, date="2026-10-11")
+    assert [x["text"] for x in selected] == ["aaaa", "bbbb"]
+    assert remaining == 0
+
+
+def test_backlog_mark_consumed_is_idempotent_and_stats_track_chars(tmp_path):
+    from lablog import backlog
+    cfg = _carryover_cfg(tmp_path)
+    backlog.append(cfg, [
+        {"text": "已完成第一项工作。", "created_date": "2026-10-10"},
+        {"text": "已完成第二项工作内容。", "created_date": "2026-10-11"},
+    ])
+    before = backlog.stats(cfg)
+    assert before["pending_items"] == 2
+    assert before["pending_chars"] == backlog.char_count("已完成第一项工作。") + backlog.char_count("已完成第二项工作内容。")
+
+    selected, _, _ = backlog.take(cfg, 100)
+    ids = [x["id"] for x in selected]
+    assert backlog.mark_consumed(cfg, ids, "2026-10-13", "report-9") == 2
+    assert backlog.mark_consumed(cfg, ids, "2026-10-13", "report-9") == 0  # idempotent
+
+    after = backlog.stats(cfg)
+    assert after["pending_items"] == 0 and after["pending_chars"] == 0
+    assert after["consumed_items"] == 2
+
+
+def test_carryover_disabled_leaves_body_untouched_and_draft_free_of_field(tmp_path):
+    from lablog import backlog
+    from lablog.cli import _apply_carryover
+    from lablog.periods import format_period_marker
+    cfg = _carryover_cfg(tmp_path, enabled=False)
+    body = "".join(f"项目VR的第{i}项工作已完成并通过自测。" for i in range(1, 21))
+    draft = _daily_draft(format_period_marker("daily", "2026-10-13"), body)
+    evidence = {"facts": [{"source": "codex", "project": r"E:\project\VR", "evidence_id": "v1"}]}
+    snapshot = json.dumps(draft, ensure_ascii=False, sort_keys=True)
+    assert _apply_carryover(cfg, "daily", "2026-10-13", draft, evidence) == {"status": "disabled"}
+    assert json.dumps(draft, ensure_ascii=False, sort_keys=True) == snapshot
+    assert "carryover" not in draft
+    assert not backlog._path(cfg).exists()
+
+
+def test_carryover_trims_above_target_and_queues_overflow(tmp_path):
+    from lablog import backlog
+    from lablog.cli import _apply_carryover
+    from lablog.periods import format_period_marker
+    cfg = _carryover_cfg(tmp_path, target=200)
+    # Five themes so whole trailing blocks can be staged while still meeting the
+    # lower bound from the blocks that remain.
+    names = ["VR", "钉钉", "Other", "Alpha", "Beta"]
+    body = "".join(
+        f"项目{name}的第{i}项工作已完成并通过了本地自测。"
+        for name in names for i in range(1, 6))
+    marker = format_period_marker("daily", "2026-10-13")
+    draft = _daily_draft(marker, body, citations={"今日完成": ["e1"]})
+    evidence = {"facts": [{"source": "codex", "project": str(tmp_path / name), "evidence_id": name}
+                          for name in names]}
+    result = _apply_carryover(cfg, "daily", "2026-10-13", draft, evidence)
+    assert result["status"] == "applied"
+    kept_value = draft["fields"][0]["value"]
+    assert kept_value.startswith(marker + "\n")  # period marker is not part of the budget
+    kept_body = kept_value.split("\n", 1)[1]
+    assert backlog.char_count(kept_body) >= 200  # meets the lower bound
+    assert kept_body.endswith("。")  # cut on a sentence boundary
+
+    items = backlog.load(cfg)["items"]
+    assert items and all(x["kind"] == "completed" for x in items)
+    assert result["target_chars"] == 200
+    assert result["kept_chars"] == backlog.char_count(kept_body)
+    assert result["queued_items"] and result["queued_chars"] == sum(backlog.char_count(x["text"]) for x in items)
+    assert draft["carryover"]["target_chars"] == 200
+    assert draft["carryover"]["queued_items"] == result["queued_items"]
+    assert json.loads(json.dumps(draft["carryover"])) == draft["carryover"]
+
+
+def test_carryover_keeps_whole_theme_blocks_and_tags_plan(tmp_path):
+    from lablog import backlog
+    from lablog.cli import _apply_carryover
+    from lablog.periods import format_period_marker
+    cfg = _carryover_cfg(tmp_path, target=120, plan_extra=True)
+    vr = "".join(f"项目VR的第{i}项联调工作已完成。" for i in range(1, 5))
+    md = "".join(f"项目Markdown的第{i}项文档工作已完成。" for i in range(1, 5))
+    marker = format_period_marker("daily", "2026-10-13")
+    plan_text = "明天准备推进第二批界面接入与联调。"
+    draft = _daily_draft(marker, vr + md, plan=plan_text)
+    # markdown theme is derived from the note's parent directory.
+    evidence = {"facts": [
+        {"source": "codex", "project": r"E:\project\VR", "evidence_id": "v1"},
+        {"source": "markdown", "path": str(tmp_path / "notes" / "2026-10-13.md"), "evidence_id": "m1"}]}
+    _apply_carryover(cfg, "daily", "2026-10-13", draft, evidence)
+    items = backlog.load(cfg)["items"]
+    plan_items = [x for x in items if x["kind"] == "plan"]
+    completed_items = [x for x in items if x["kind"] == "completed"]
+    assert [x["text"] for x in plan_items] == [plan_text]
+    # Each queued completed item is a run of whole sentences, never a fragment.
+    for entry in completed_items:
+        for sentence in entry["text"].split("\n"):
+            assert sentence.endswith("。")
+    kept_body = draft["fields"][0]["value"].split("\n", 1)[1]
+    for sentence in kept_body.split("\n"):
+        assert sentence.endswith("。")
+
+
+def test_fill_from_backlog_uses_completed_only_and_keeps_blocker_when_empty(tmp_path):
+    from lablog import backlog
+    from lablog.cli import _fill_from_backlog
+    from lablog.periods import format_period_marker
+    # Completed present -> filled, blocker removed.
+    cfg = _carryover_cfg(tmp_path)
+    backlog.append(cfg, [
+        {"text": "十月遗留的已完成工作总结。", "created_date": "2026-10-08", "kind": "completed"},
+        {"text": "明天准备推进第二批界面接入。", "created_date": "2026-10-08", "kind": "plan"},
+    ])
+    draft = _daily_draft(format_period_marker("daily", "2026-10-20"), "")
+    draft["blockers"] = ["no dated completion evidence"]
+    result = _fill_from_backlog(cfg, "daily", "2026-10-20", draft, {"facts": []})
+    assert result["status"] == "filled"
+    body = draft["fields"][0]["value"].split("\n", 1)[1]
+    assert "十月遗留的已完成工作总结。" in body
+    assert "明天准备推进" not in body  # plan text must never stand in for completed work
+    assert "no dated completion evidence" not in draft["blockers"]
+    assert draft["carryover"]["filled_items"]
+
+    # Empty backlog -> skipped, blocker preserved.
+    empty = _carryover_cfg(tmp_path / "empty")
+    draft_empty = _daily_draft(format_period_marker("daily", "2026-10-20"), "")
+    draft_empty["blockers"] = ["no dated completion evidence"]
+    skipped = _fill_from_backlog(empty, "daily", "2026-10-20", draft_empty, {"facts": []})
+    assert skipped["status"] == "skipped"
+    assert "no dated completion evidence" in draft_empty["blockers"]
+
+    # Only plan items -> skipped, blocker preserved.
+    plan_only = _carryover_cfg(tmp_path / "plan-only")
+    backlog.append(plan_only, [{"text": "明天准备推进第二批。", "created_date": "2026-10-08", "kind": "plan"}])
+    draft_plan = _daily_draft(format_period_marker("daily", "2026-10-20"), "")
+    draft_plan["blockers"] = ["no dated completion evidence"]
+    plan_skipped = _fill_from_backlog(plan_only, "daily", "2026-10-20", draft_plan, {"facts": []})
+    assert plan_skipped["status"] == "skipped"
+    assert "no dated completion evidence" in draft_plan["blockers"]
+
+
+def test_backfilled_body_has_no_traceability_markers(tmp_path):
+    import re
+    from lablog import backlog
+    from lablog.cli import _fill_from_backlog
+    from lablog.periods import format_period_marker
+    cfg = _carryover_cfg(tmp_path)
+    # A legacy-looking item still carrying an inline citation must be cleaned.
+    backlog.append(cfg, [{"text": "完成了解析器修复 [证据:abc123]。", "created_date": "2026-10-08"}])
+    draft = _daily_draft(format_period_marker("daily", "2026-10-20"), "")
+    draft["blockers"] = ["no dated completion evidence"]
+    _fill_from_backlog(cfg, "daily", "2026-10-20", draft, {"facts": []})
+    body = draft["fields"][0]["value"]
+    assert not re.search(r"\[证据:", body)
+
+
+def test_submit_consumes_backlog_only_after_verified(tmp_path, monkeypatch):
+    from lablog import backlog
+    from lablog.workflow import atomic_json
+    cfg, path, draft, fake = _ready_submission(tmp_path, monkeypatch)
+    backlog.append(cfg, [{"text": "待补交的完成内容。", "created_date": "2026-10-08"}])
+    item_id = backlog.load(cfg)["items"][0]["id"]
+    draft["carryover"] = {"filled_items": [item_id], "filled_chars": 9}
+    atomic_json(path, freeze_draft(draft))
+    signed = json.loads(path.read_text(encoding="utf-8"))
+    result = _submit(cfg, path, signed["hash"])
+    assert result["status"] == "verified"
+    assert result["backlog_consumed"] == 1
+    entry = backlog.load(cfg)["items"][0]
+    assert entry["status"] == "consumed"
+    assert entry["consumed_report_id"] == "report-1"
+
+
+def test_submit_failure_never_consumes_backlog(tmp_path, monkeypatch):
+    from lablog import backlog
+    from lablog.workflow import atomic_json
+    cfg, path, draft, fake = _ready_submission(tmp_path, monkeypatch, outcome="timeout")
+    backlog.append(cfg, [{"text": "待补交的完成内容。", "created_date": "2026-10-08"}])
+    item_id = backlog.load(cfg)["items"][0]["id"]
+    draft["carryover"] = {"filled_items": [item_id], "filled_chars": 9}
+    atomic_json(path, freeze_draft(draft))
+    signed = json.loads(path.read_text(encoding="utf-8"))
+    with pytest.raises(DwsBlocked):
+        _submit(cfg, path, signed["hash"])
+    assert backlog.load(cfg)["items"][0]["status"] == "pending"
+    assert backlog.load(cfg)["items"][0]["consumed_report_id"] is None
+
+
+def test_draft_hash_is_self_consistent_with_carryover(tmp_path):
+    from lablog.cli import _apply_carryover
+    from lablog.periods import format_period_marker
+    from lablog.workflow import draft_hash
+    cfg = _carryover_cfg(tmp_path, target=200)
+    body = "".join(f"项目VR的第{i}项联调工作已完成并通过了本地自测。" for i in range(1, 5))
+    body += "".join(f"钉钉项目的第{i}项接入工作已完成并完成验证。" for i in range(1, 5))
+    draft = _daily_draft(format_period_marker("daily", "2026-10-13"), body)
+    evidence = {"facts": [{"source": "codex", "project": r"E:\project\VR", "evidence_id": "v1"},
+                          {"source": "codex", "project": r"E:\project\钉钉", "evidence_id": "d1"}]}
+    _apply_carryover(cfg, "daily", "2026-10-13", draft, evidence)
+    draft["hash"] = draft_hash(draft)
+    assert draft["hash"] == draft_hash(draft)
+
+

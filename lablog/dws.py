@@ -4,12 +4,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 from decimal import Decimal, InvalidOperation
 
 
 class DwsBlocked(Exception):
     pass
+
+
+class DwsNoReportId(DwsBlocked):
+    """``entry submit`` succeeded but the CLI response carried no report id."""
+
+    def __init__(self, message="DWS submit returned no report ID; outcome unknown"):
+        super().__init__(message)
 
 
 def template_fields(template):
@@ -74,6 +82,67 @@ def encode_contents(draft, template, date_encoding):
         result.append({"key": name, "sort": str(sort), "type": str(field_type),
                        "content": encoded, "contentType": "markdown" if field_type == 1 else "origin"})
     return result
+
+
+def reports_success(data):
+    """Accept every success envelope the DWS CLI has used for Report leaves.
+
+    Atomic leaves answer ``{"success": true, "result": {...}}`` (no ``errcode``);
+    legacy/other leaves answer ``{"errcode": 0, "success": true, ...}``; some
+    helpers answer ``{"ok": true, "outcome": "success", ...}``.
+    """
+    if not isinstance(data, dict):
+        return False
+    if data.get("success") is True:
+        return True
+    if data.get("errcode") == 0:
+        return True
+    if data.get("ok") is True and data.get("outcome") == "success":
+        return True
+    return False
+
+
+_REPORT_ID_KEYS = ("reportId", "report_id", "report_Id", "id")
+_WRAPPER_KEYS = ("result", "data", "report", "reports")
+_REPORT_ID_RE = re.compile(r"^[0-9a-zA-Z_-]{16,64}$")
+_URL_ID_RE = re.compile(r"[?&]id=([0-9a-zA-Z_-]+)")
+
+
+def extract_report_id(data):
+    """Find the created report id across the envelopes DWS has used."""
+    def visit(node, depth=0):
+        if depth > 5:
+            return None
+        if isinstance(node, str):
+            return node.strip() if _REPORT_ID_RE.match(node.strip()) else None
+        if isinstance(node, list):
+            for item in node:
+                found = visit(item, depth + 1)
+                if found:
+                    return found
+            return None
+        if isinstance(node, dict):
+            for key in _REPORT_ID_KEYS:
+                value = node.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            for key in _WRAPPER_KEYS:
+                if key in node:
+                    found = visit(node[key], depth + 1)
+                    if found:
+                        return found
+        return None
+
+    found = visit({key: data[key] for key in _WRAPPER_KEYS if key in data})
+    if found:
+        return found
+    for key in ("dingtalkOpenUrl", "dingtalkOpenMarkdownLink"):
+        value = data.get(key)
+        if isinstance(value, str):
+            match = _URL_ID_RE.search(value)
+            if match:
+                return match.group(1)
+    return None
 
 
 class DwsClient:
@@ -160,16 +229,17 @@ class DwsClient:
             if data.get("dry_run") is not True or data.get("executed") is not False or data.get("tool") != "create_report":
                 raise DwsBlocked("DWS dry-run response does not prove nonexecution")
             return data
-        if data.get("errcode") != 0 or data.get("success") is not True:
+        if not reports_success(data):
             raise DwsBlocked("DWS submit failed; outcome unknown")
-        result = data.get("result")
-        report_id = result if isinstance(result, str) else (result or {}).get("reportId") or (result or {}).get("report_id")
+        report_id = extract_report_id(data)
+        # The current CLI answers success without a reportId ("create response did
+        # not include reportId"); callers resolve the id from the outbox instead.
         if not isinstance(report_id, str) or not report_id.strip():
-            raise DwsBlocked("DWS submit returned no report ID; outcome unknown")
+            raise DwsNoReportId()
         return report_id
 
     def detail(self, report_id):
         data = self.call(["report", "entry", "get", "--report-id", report_id])
-        if data.get("errcode") != 0 or data.get("success") is not True:
+        if not reports_success(data):
             raise DwsBlocked("DWS detail readback failed")
-        return data.get("result") or {}
+        return data.get("result") or data.get("data") or {}

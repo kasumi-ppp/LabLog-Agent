@@ -41,6 +41,80 @@ python -X utf8 -m lablog --config config/config.local.yaml submit --draft data/d
 
 dry-run 不能证明服务端接受请求。提交结果未知时使用 `reconcile` 只读核对，不能重复提交或清空状态。日期值编码尚未核实时会阻止真实提交；周报/月报模板不允许添加收件人的语义也需要进一步核实。
 
+## 正文可持续发展（backlog）
+
+日报正文（「今日完成」字段）有目标字数 `target_chars`（默认 200）。开启后生成草稿时按**主题完整性**裁剪：把正文按主题聚合成块（Codex 证据用 `project`，git 证据用 `project` 或 `source_path`，markdown 证据用父目录），整块保留直到达到 `target_chars`，**绝不从句子中间截断**。溢出的整块正文写入本地 backlog（`<data_dir>/backlog/items.json`）留待以后补交；某个主题块单块就超过 `target_chars` 时整块保留、不入队。
+
+`target_chars` 是**下限而非上限**——宁可超过，也不为了凑字数把工作说一半。
+
+入队条目带分类字段 `kind`：`completed`（来自「今日完成」）与 `plan`（来自「明日计划」，是否入队由 `plan_extra` 控制）。当某天的日报**没有**当日完成证据（blocker `no dated completion evidence`）时，从 backlog 取 `kind=completed` 的条目拼成正文填入「今日完成」并移除该 blocker；backlog 为空或只有 `plan` 条目时保持 skipped、blocker 保留。**`plan` 条目永远不会被拿来补交**，避免「计划冒充已完成工作」。
+
+消费时机：**只有提交并被读回校验成功（status=verified）之后**才把用掉的条目标记 `consumed`；提交失败或结果未知时**不标记**，下次还能重用。
+
+```powershell
+# 查看当前 backlog
+python -X utf8 -m lablog --config config/config.local.yaml backlog --show
+
+# 清理已消费/过期条目
+python -X utf8 -m lablog --config config/config.local.yaml backlog --prune
+
+# 清空 backlog（需显式确认）
+python -X utf8 -m lablog --config config/config.local.yaml backlog --clear --yes
+```
+
+```yaml
+quality:
+  carryover:
+    enabled: true           # 默认关闭；true 才启用裁剪+入队+补交
+    target_chars: 200       # 正文目标字数（下限）
+    apply_to: ["completed"] # 参与裁剪入队的字段，默认只有「今日完成」
+    plan_extra: true        # 「明日计划」的多余内容也入队（标 kind=plan）
+```
+
+## 全自动（无人值守）
+
+`auto` 子命令把整条链路串成一次运行：预检 → 采集 → 生成 → 预览 → dry-run →（`--submit`）提交 → 读回校验。
+全自动链路同样走 carryover：`auto` 生成草稿时按同一规则裁剪并入队，提交成功并读回校验后消费 backlog。
+任何一步受阻立即停止，**永不重试结果未知的提交**；已提交过的周期不会被重复生成。
+
+```powershell
+# 只跑到 dry-run，不提交
+python -X utf8 -m lablog --config config/config.auto.yaml auto --kind daily --date 2026-10-13
+
+# 全自动提交（日期默认取当天，Asia/Shanghai）
+python -X utf8 -m lablog --config config/config.auto.yaml auto --kind daily --submit
+
+# 注册并试跑 Windows 计划任务（时间见 schedule.auto_daily_time，默认 21:00）
+.\scripts\register-auto-task.ps1 -Python 'E:\Anaconda3\python.exe' -Config 'config/config.auto.yaml' -Enable
+.\scripts\auto.ps1 -Python 'E:\Anaconda3\python.exe' -Config 'config/config.auto.yaml' -Kind daily -DraftOnly
+```
+
+退出码 `0` = 正常（`not_due` / `already_submitted` / `ready` / `verified`），`2` = 需人工处理（`blocked` / `unknown` / `mismatch` / `error`）。
+日志在 `data/scheduler/auto-<kind>-<date>.log`。受阻时按 `notify` 配置发提醒邮件（钉钉邮箱 + QQ）。
+`register-auto-task.ps1` 只在配置里 `schedule.auto_submit_enabled: true` 时才愿意注册会真提交的任务。
+
+无人值守可用的引擎只有 `extractive`（`codex` 需联网）；`assisted` 需外部提供 `--ai-result-file`。
+
+### 范围接口（供 Codex / 其它 agent 调用）
+
+当前默认证据范围（2026-10-13 用户划定，见 `config/config.auto.yaml`）：只采 **`E:\project\galgame news`、`E:\project\Comfyui`、`E:\project\VR`** 三个项目——Codex 会话按 `cwd` 前缀匹配，`git_paths` 列出这三个项目下的全部仓库（`galgame news`、`VR\TBM-ui-fix`、`VR\TBMproject`、`VR\TBMproject-remote-metadata`）。注意 `Comfyui` 不是 git 仓库，只能靠会话记录采集。
+
+运行范围不写死在代码里。任何工具写一份 scope JSON 即可决定「这次运行可以看哪些证据」：
+
+```json
+{
+  "project_paths": ["E:/project/VR"],
+  "session_ids": [],
+  "exclude_paths": ["E:/project/旧项目"],
+  "git_paths": ["E:/project/VR/TBMproject"],
+  "markdown_paths": ["E:/project/VR/TBM-ui-fix/docs"]
+}
+```
+
+只覆盖出现的键，未出现的沿用配置文件；`project_paths` / `session_ids` 会让采集切到 `selected` 白名单模式，`session_ids` 可直接指定某次对话。
+`auto` / `collect` / `generate` 均支持 `--scope-file <路径>`；计划任务会自动识别 `config/scope.json`（存在即生效，删除即回到默认范围）。
+未知键或类型错误会被拒绝，实际生效的来源记录在运行结果的 `scope_source` 里。示例见 `config/scope.example.json`。
+
 ## 运行与范围
 
 ```powershell
@@ -50,4 +124,4 @@ python -X utf8 -m pytest -q
 
 主要说明：[配置](docs/configuration.md)、[环境验收](docs/environment_report.md)、[Windows 调度](docs/scheduling.md)、[故障处理](docs/troubleshooting.md)。
 
-原始会话、真实日报、个人身份配置和回执均保留在被 Git 忽略的本地目录。自动过滤不能穷尽所有私密信息，正式发送前仍需审阅摘要。当前版本不启用无人值守真实提交，不处理真实图片/附件上传。
+原始会话、真实日报、个人身份配置和回执均保留在被 Git 忽略的本地目录。自动过滤不能穷尽所有私密信息，正式发送前仍需审阅摘要。无人值守真实提交默认关闭，仅在显式设置 `schedule.auto_submit_enabled: true` 并注册 `auto` 任务后启用；不处理真实图片/附件上传。

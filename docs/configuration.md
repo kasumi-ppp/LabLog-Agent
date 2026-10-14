@@ -18,8 +18,11 @@
 | date_encoding | 经权威依据核实的日期值契约；未知时保持 verified=false |
 | calendar.file | 对应年度的节假日/调休日历，包含来源和更新时间 |
 | schedule | 时间、周截止日、月截止日；auto_submit 必须 false |
+| quality.carryover | 正文可持续发展：按主题完整性裁剪正文、溢出内容入本地 backlog 留待以后补交 |
 
 本机首轮配置只采集当前 LabLog-Agent 项目。要整合其他 Codex 工作，将其项目目录加入 project_paths；按项目筛选仍会自动收集该项目相关会话。需要限定具体会话可再填写 session_ids。没有项目路径或会话 ID 时不采集 Codex 会话。完全一致的重复片段会合并并保留来源，计划和完成等状态不同的内容分开处理。不要把 Codex 全部会话默认视为科研工作。
+
+`quality.carryover` 控制「正文可持续发展」。默认未配置时 `enabled: false`，生成与提交行为与开启前逐字一致。`target_chars`（默认 200）是正文目标字数，是**下限而非上限**：生成草稿时把正文按主题聚合成块整块保留直到达到该字数，绝不从句子中间截断，宁可超过也不把工作说一半。`apply_to` 默认 `["completed"]`，即只有「今日完成」参与裁剪入队；`plan_extra: true` 时「明日计划」的多余内容也入队并标记 `kind=plan`。溢出内容写入 `<data_dir>/backlog/items.json`，仅在提交被读回校验成功（status=verified）后才标记消费；`kind=plan` 的条目永远不会被用于补交。日常可用 `backlog --show` / `backlog --prune` / `backlog --clear --yes` 查看与清理。
 
 `history_from` 是远端重复检查的最早创建时间；如需覆盖更早报告，首次生成前应把它设到足够早的日期。范围之外的历史不会被视为“没有重复”，提交会因查重覆盖不足而停止。
 

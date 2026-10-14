@@ -15,6 +15,22 @@ FIELDS = {
     "monthly": {"completed": "本月工作内容", "summary": "本月工作总结", "plan": "下月工作计划", "coordination": "需帮助与支持"},
 }
 PLAN_INTENT = re.compile(r"(?i)(?:明天|下周|下月|计划|打算|准备|待办|todo|to-do|next\s+(?:day|week|month))")
+CITATION = re.compile(r"\s*\[证据:([^\]]+)\]")
+UNVERIFIED_NOTE = re.compile(r"[（(]\s*会话报告[，,]\s*未独立核验\s*[）)]")
+
+
+def reader_text(value):
+    """Strip machine-readable traceability marks from text a person will read.
+
+    A submitted report is read by colleagues, so the body must be prose rather
+    than a citation list. Traceability is kept instead in ``draft["citations"]``
+    plus ``draft["evidence_ids"]`` and shown in the local preview.
+    """
+    if not isinstance(value, str):
+        return value
+    text = UNVERIFIED_NOTE.sub("", CITATION.sub("", value))
+    lines = [line.rstrip() for line in text.splitlines()]
+    return "\n".join(line for line in lines if line.strip() not in {"", "-", "*"})
 
 
 def _evidence_lines(facts, statuses):
@@ -67,6 +83,15 @@ def build_draft(kind, day, template, evidence, *, manual_text=None, hours=None, 
             raise ValueError("invalid hours")
         values[names["hours"]] = format(parsed, "f")
     fields = []
+    citations = {}
+    for name in (names["completed"], names["summary"], names.get("plan")):
+        if not name or not isinstance(values.get(name), str):
+            continue
+        found = sorted(set(CITATION.findall(values[name])))
+        if not found:
+            continue  # verbatim manual text must stay untouched
+        citations[name] = found
+        values[name] = reader_text(values[name])
     values[names["completed"]] = format_period_marker(kind, day) + "\n" + values[names["completed"]]
     for field in template_fields(template):
         name = field["field_name"]
@@ -81,6 +106,7 @@ def build_draft(kind, day, template, evidence, *, manual_text=None, hours=None, 
              "template_name": template.get("report_template_name"),
              "template_fingerprint": template_fingerprint(template),
              "fields": fields, "evidence_ids": [f["evidence_id"] for f in facts],
+             "citations": citations,
              "blockers": blockers, "generation_engine": "codex" if ai_result is not None else "extractive",
              "warnings": evidence.get("warnings", [])}
     return freeze_draft(draft)

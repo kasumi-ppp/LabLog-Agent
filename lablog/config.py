@@ -15,6 +15,13 @@ def load_config(path):
     if not isinstance(config, dict):
         raise ValueError("config must be a mapping")
     config["_base"] = str(path.parent.parent if path.parent.name == "config" else path.parent)
+    # Carryover defaults; enabled stays False so an unconfigured deployment keeps
+    # the previous behaviour of submitting the whole body verbatim.
+    config["quality"] = {**(config.get("quality") or {})}
+    quality = config["quality"]
+    quality["carryover"] = {"enabled": False, "target_chars": 200,
+                            "apply_to": ["completed"], "plan_extra": True,
+                            **(quality.get("carryover") or {})}
     return config
 
 

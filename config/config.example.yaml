@@ -42,6 +42,14 @@ date_encoding:
   format: unknown
 quality:
   omit_hours: true  # User preference: leave 总工时/h empty.
+  # 正文可持续发展（backlog）：默认关闭，行为与开启前逐字一致。
+  # 开启后按主题完整性裁剪「今日完成」正文，溢出内容入队留待以后补交。
+  carryover:
+    enabled: false
+    target_chars: 200
+    apply_to:
+      - completed
+    plan_extra: true
 history_from: "2026-01-01"  # Required for remote duplicate guard, earliest report to inspect.
 calendar:
   file: config/calendars/2026.json
