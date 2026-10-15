@@ -1,5 +1,5 @@
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -168,7 +168,7 @@ def _ready_submission(tmp_path, monkeypatch, *, outcome="verified"):
             return "report-1"
         def detail(self, ident):
             if ident == "existing":
-                return {"report_template_id": "t", "work_period": {"start": "2026-10-13", "end": "2026-10-13"}}
+                return {"report_template_id": "t", "work_period": {"start": today, "end": today}}
             return {"report_template_id": "t", "contents": [{"key": "今日完成", "content": "Wrong" if outcome == "mismatch" else "Done"}]}
     fake = FakeDws()
     monkeypatch.setattr(cli, "_client", lambda config: fake)
@@ -369,8 +369,9 @@ def test_possible_remote_duplicate_blocks_before_submit(tmp_path, monkeypatch):
 def test_old_report_in_another_period_does_not_block_new_period(tmp_path, monkeypatch):
     cfg, path, draft, fake = _ready_submission(tmp_path, monkeypatch)
     fake.outbox = lambda *a: [{"reportId": "existing"}]
+    other = (date.fromisoformat(draft["date"]) - timedelta(days=1)).isoformat()
     fake_detail = fake.detail
-    fake.detail = lambda ident: ({"report_template_id": "t", "work_period": {"start": "2026-10-12", "end": "2026-10-12"}}
+    fake.detail = lambda ident: ({"report_template_id": "t", "work_period": {"start": other, "end": other}}
                                  if ident == "existing" else fake_detail(ident))
     assert _submit(cfg, path, draft["hash"])["status"] == "verified"
 

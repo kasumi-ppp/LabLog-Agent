@@ -93,8 +93,8 @@ TMPDIR=$PWD/.tmp/pytest TEMP=$PWD/.tmp/pytest TMP=$PWD/.tmp/pytest \
 
 | 阶段 | 通过 | 失败 | 说明 |
 |---|---|---|---|
-| 修改前基线 | 80 | 1 | 失败项为既有缺陷 `test_possible_remote_duplicate_blocks_before_submit`（其假 outbox 无工作周期标记），与本次无关，保持原样 |
-| 修改后 | **122** | **1** | 同一个既有缺陷；新增 42 个用例全部通过，无回归 |
+| 修改前基线 | 80 | 1 | 失败项为既有夹具缺陷 `test_possible_remote_duplicate_blocks_before_submit`（假 outbox 的 `detail` 写死 `2026-10-13`，与草稿周期不匹配导致查重未触发），与本次改动无关 |
+| 修改后 | **123** | **0** | 新增 42 个用例全部通过，无回归；该夹具缺陷已改为相对 today 构造周期，全量 123 passed |
 
 测试文件分布：`test_lablog.py` 81（原有）、`test_reliability.py` 24、`test_drafts.py` 9、`test_operations.py` 9。
 
@@ -140,4 +140,4 @@ powershell -NoProfile -File scripts/check-heartbeat.ps1 -Python E:/Anaconda3/pyt
 3. **未登录不运行**：计划任务仍是 Interactive 登录，关机/未登录期间的漏跑只能回溯发现（下次登录首跑或手动 `doctor --check-schedule`）。
 4. **目录项持久化**：Windows 无法 fsync 目录，`os.replace` 的目录项持久性依赖 NTFS 行为，断电场景未做额外保证。
 5. **poll 依赖墙钟**：`os.replace` 退避重试依赖 `time.sleep`，与锁超时共用同一时钟；极端时钟跳变场景未验证。
-6. **既有缺陷未修**：`test_possible_remote_duplicate_blocks_before_submit` 仍失败（假 outbox 缺周期标记导致查重未阻断），属测试夹具问题，本次按「不扩大范围」原则未改。
+6. **（已消除）夹具周期缺陷**：`test_possible_remote_duplicate_blocks_before_submit` 曾因假 outbox 的 `detail` 写死 `2026-10-13` 而恒失败；已改为相对 today 构造工作周期（`tests/test_lablog.py` `_ready_submission` 与 `test_old_report_in_another_period_does_not_block_new_period`），当前全量 123 passed / 0 failed。
