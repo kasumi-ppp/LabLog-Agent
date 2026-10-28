@@ -9,7 +9,7 @@ from lablog.sources import collect_codex, collect_markdown, period_bounds
 from lablog.workflow import freeze_draft, validate_submission, SubmissionBlocked
 from lablog.dws import template_fingerprint, encode_contents, DwsBlocked, DwsClient
 from lablog.report import build_draft
-from lablog.cli import _approval_context, _deduplicate_facts, _outbox_history, _preview_markdown, _readback_matches, _report_period, _submit, _reconcile, _verify_recipients
+from lablog.cli import _approval_context, _deduplicate_facts, _outbox_history, _preflight, _preview_markdown, _readback_matches, _report_period, _submit, _reconcile, _verify_recipients
 from lablog.config import is_workday, schedule_due
 from lablog.ai import validate_ai_result
 
@@ -134,16 +134,23 @@ def test_markdown_uses_declared_date_not_filesystem_mtime(tmp_path):
     assert any("date" in x for x in result["warnings"])
 
 
-def _ready_submission(tmp_path, monkeypatch, *, outcome="verified"):
+def _ready_submission(tmp_path, monkeypatch, *, outcome="verified", allow_add_receivers=1,
+                      fixed_recipients=None):
     import lablog.cli as cli
     from lablog.workflow import atomic_json
     today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
-    template = {"report_template_id": "t", "report_template_name": "学生日报", "allowAddReceivers": 1,
+    template = {"report_template_id": "t", "report_template_name": "学生日报",
+                "allowAddReceivers": allow_add_receivers,
                 "report_template_fields": [{"field_name": "今日完成", "field_sort": 0, "field_type": 1}]}
+    daily_template = {"id": "t", "name": "学生日报"}
+    # fixed_recipients lives in the template config, which _approval_context hashes,
+    # so it must be set before the draft is frozen.
+    if fixed_recipients is not None:
+        daily_template["fixed_recipients"] = fixed_recipients
     cfg = {"_base": str(tmp_path), "data_dir": "data", "dws": {"profile": "p"},
            "identity": {"corp_id": "corp", "user_id": "self", "corp_name": "lab", "user_name": "Self"},
            "recipients": [{"name": "Recipient", "user_id": "r", "corp_name": "lab"}],
-           "templates": {"daily": {"id": "t", "name": "学生日报"}}, "history_from": today}
+           "templates": {"daily": daily_template}, "history_from": today}
     draft = freeze_draft({"kind": "daily", "date": today, "template_id": "t", "template_name": "学生日报",
                           "template_fingerprint": template_fingerprint(template),
                           "fields": [{"name": "今日完成", "type": 1, "value": "Done"}], "blockers": [],
@@ -355,6 +362,61 @@ def test_receiver_permission_blocks_before_submit(tmp_path, monkeypatch):
     fake.template = lambda name, ident: {**original(name, ident), "allowAddReceivers": 0}
     with pytest.raises(SubmissionBlocked, match="template drift"):
         _submit(cfg, path, draft["hash"])
+    assert fake.submits == 0
+
+
+def test_receiver_restriction_is_a_real_blocker_not_a_test_bypass(tmp_path, monkeypatch):
+    cfg, _, draft, fake = _ready_submission(tmp_path, monkeypatch)
+    original = fake.template
+
+    def restricted(name, ident):
+        return {**original(name, ident), "allowAddReceivers": 0}
+
+    fake.template = restricted
+    # Re-freeze using the restricted live template so this reaches the explicit
+    # receiver-semantics gate instead of being classified as template drift.
+    draft["template_fingerprint"] = template_fingerprint(restricted("学生日报", "t"))
+    from lablog.workflow import atomic_json
+    atomic_json(tmp_path / "draft.json", freeze_draft(draft))
+    with pytest.raises(SubmissionBlocked, match="no fixed recipient list is declared"):
+        _preflight(cfg, draft)
+    assert fake.submits == 0
+
+
+def test_fixed_receiver_list_matching_config_passes_preflight(tmp_path, monkeypatch):
+    """allowAddReceivers=0 is not a blanket block: an exactly matching declared
+    list keeps every recipient verified through client.contact()."""
+    cfg, _, draft, fake = _ready_submission(
+        tmp_path, monkeypatch, allow_add_receivers=0,
+        fixed_recipients=[{"name": "Recipient", "user_id": "r", "corp_name": "lab"}])
+    assert draft["template_fingerprint"] == template_fingerprint(fake.template("学生日报", "t"))
+    client, _template, user_ids, contents = _preflight(cfg, draft)
+    assert user_ids == ["r"]
+    assert [item["key"] for item in contents] == ["今日完成"]
+    assert fake.submits == 0
+
+
+@pytest.mark.parametrize("fixed_recipients", [
+    [{"name": "Recipient", "user_id": "r", "corp_name": "lab"},
+     {"name": "Second", "user_id": "r2", "corp_name": "lab"}],
+    [{"name": "Other", "user_id": "r9", "corp_name": "lab"}],
+])
+def test_fixed_receiver_list_mismatch_blocks_preflight(tmp_path, monkeypatch, fixed_recipients):
+    """Adding or dropping a name against a template-fixed list stays blocked."""
+    cfg, _, draft, fake = _ready_submission(
+        tmp_path, monkeypatch, allow_add_receivers=0, fixed_recipients=fixed_recipients)
+    with pytest.raises(SubmissionBlocked, match="do not match the template's fixed receiver list"):
+        _preflight(cfg, draft)
+    assert fake.submits == 0
+
+
+def test_fixed_receiver_list_with_duplicate_ids_blocks_preflight(tmp_path, monkeypatch):
+    cfg, _, draft, fake = _ready_submission(
+        tmp_path, monkeypatch, allow_add_receivers=0,
+        fixed_recipients=[{"name": "Recipient", "user_id": "r", "corp_name": "lab"},
+                          {"name": "Recipient Again", "user_id": "r", "corp_name": "lab"}])
+    with pytest.raises(SubmissionBlocked, match="fixed recipient list has duplicates"):
+        _preflight(cfg, draft)
     assert fake.submits == 0
 
 
@@ -765,6 +827,70 @@ def test_scope_file_overrides_only_the_keys_it_names(tmp_path):
     assert scoped["scope_source"].endswith("scope.json")
 
 
+def test_scope_file_cannot_remove_configured_exclusions(tmp_path):
+    import lablog.cli as cli
+    cfg = {"codex": {"exclude_paths": ["E:/project/galgame news", "E:/project/Comfyui"]},
+           "supplemental": {}}
+    scope = tmp_path / "scope.json"
+    scope.write_text(json.dumps({"exclude_paths": []}), encoding="utf-8")
+
+    scoped = cli._apply_scope(cfg, str(scope))
+
+    assert scoped["codex"]["exclude_paths"] == cfg["codex"]["exclude_paths"]
+
+
+def test_excluded_directories_block_explicit_and_parent_supplemental_paths():
+    from lablog.cli import _filter_excluded_paths
+
+    paths = ["E:/project/galgame news", "E:/project", "E:/project/VR"]
+    assert _filter_excluded_paths(paths, ["e:\\PROJECT\\GalGame News\\"]) == ["E:/project/VR"]
+
+
+def test_collection_applies_exclusions_to_supplemental_sources(tmp_path, monkeypatch):
+    import lablog.cli as cli
+    seen = {}
+
+    def capture(key, paths):
+        seen[key] = [str(x) for x in paths]
+        return {"facts": [], "warnings": []}
+
+    monkeypatch.setattr(cli, "collect_codex", lambda *a, **k: {"facts": [], "warnings": []})
+    monkeypatch.setattr(cli, "collect_git", lambda paths, *a: capture("git", paths))
+    monkeypatch.setattr(cli, "collect_markdown", lambda paths, *a: capture("markdown", paths))
+    cfg = {
+        "data_dir": str(tmp_path),
+        "codex": {"mode": "auto_work", "session_roots": [], "exclude_paths": ["E:/project/galgame news"]},
+        "supplemental": {"git_paths": ["E:/project/galgame news", "E:/project", "E:/project/VR"],
+                         "markdown_paths": ["E:/project/galgame news", "E:/project", "E:/project/VR"]},
+    }
+
+    _, result = cli._collect(cfg, "daily", "2026-10-23", persist=False)
+
+    assert seen == {"git": ["E:\\project\\VR"], "markdown": ["E:\\project\\VR"]}
+    assert result["sources"][1]["scanned_paths"] == ["E:\\project\\VR"]
+
+
+def test_retained_evidence_drops_facts_from_excluded_roots(tmp_path, monkeypatch):
+    import lablog.cli as cli
+    from lablog.workflow import atomic_json
+    cfg = {"data_dir": str(tmp_path),
+           "codex": {"mode": "auto_work", "session_roots": [str(tmp_path / "missing-sessions")],
+                     "exclude_paths": ["E:/project/galgame news", "E:/project/Comfyui"]},
+           "supplemental": {}}
+    path = cli._path(cfg, "daily", "2026-10-23", "evidence")
+    atomic_json(path, {"kind": "daily", "date": "2026-10-23", "facts": [
+        {"evidence_id": "galgame", "project": "E:/project/galgame news", "text": "excluded old fact"},
+        {"evidence_id": "comfy", "source_path": "E:/project/Comfyui/work.md", "text": "excluded old file"},
+        {"evidence_id": "vr", "project": "E:/project/VR", "text": "allowed old fact"}],
+        "source_fact_count": 3, "deduped_fact_count": 3, "sources": []})
+    monkeypatch.setattr(cli, "collect_codex", lambda *a, **k: {"facts": [], "warnings": []})
+
+    _, result = cli._collect(cfg, "daily", "2026-10-23")
+
+    assert result["retention"]["action"] == "retain"
+    assert [fact["evidence_id"] for fact in result["facts"]] == ["vr"]
+
+
 def test_scope_file_rejects_unknown_keys_and_bad_types(tmp_path):
     import lablog.cli as cli
     cfg = {"codex": {}, "supplemental": {}}
@@ -1071,5 +1197,104 @@ def test_draft_hash_is_self_consistent_with_carryover(tmp_path):
     _apply_carryover(cfg, "daily", "2026-10-13", draft, evidence)
     draft["hash"] = draft_hash(draft)
     assert draft["hash"] == draft_hash(draft)
+
+
+def test_auto_submits_valid_manual_saved_draft_without_regenerating(tmp_path, monkeypatch):
+    import lablog.cli as cli
+    from lablog.workflow import atomic_json
+
+    cfg = _auto_config(tmp_path)
+    template = {"report_template_id": "t", "report_template_name": "学生日报",
+                "allowAddReceivers": 1,
+                "report_template_fields": [{"field_name": "今日完成", "field_sort": 0,
+                                             "field_type": 1}]}
+    manual_body = "人工保存的正文：已完成页面联调并核对回归结果。"
+    draft = freeze_draft({"kind": "daily", "date": "2026-10-13", "template_id": "t",
+                          "template_name": "学生日报", "template_fingerprint": template_fingerprint(template),
+                          "fields": [{"name": "今日完成", "type": 1, "sort": 0, "value": manual_body}],
+                          "blockers": [], "warnings": [], "manual_saved": True,
+                          "approval_context": _approval_context(cfg, "daily", "2026-10-13")})
+    path = tmp_path / "data" / "drafts" / "daily-2026-10-13.json"
+    atomic_json(path, draft)
+
+    class FakeDws:
+        calls = []
+
+        def auth(self):
+            return {"corp_id": "corp", "user_id": "self", "user_name": "Self"}
+
+        def template(self, name, ident):
+            assert (name, ident) == ("学生日报", "t")
+            return template
+
+        def contact(self, ident):
+            assert ident == "r"
+            return {"orgUserName": "Recipient", "orgName": "lab"}
+
+        def outbox(self, name, start, end):
+            assert name == "学生日报"
+            return []
+
+        def submit(self, ident, contents, users, **kwargs):
+            self.calls.append((ident, contents, users, kwargs))
+            return {"status": "dry_run"} if kwargs.get("dry_run") else "manual-report"
+
+        def detail(self, ident):
+            assert ident == "manual-report"
+            contents = next(call[1] for call in reversed(self.calls) if not call[3].get("dry_run"))
+            return {"report_template_id": "t", "reportId": ident, "contents": contents}
+
+    fake = FakeDws()
+    monkeypatch.setattr(cli, "_client", lambda config: fake)
+    monkeypatch.setattr(cli, "_generate", lambda *a, **k: pytest.fail("manual-saved draft must not be regenerated"))
+    result = cli._auto(cfg, "daily", "2026-10-13", "extractive", submit=True)
+
+    assert result["status"] == "verified"
+    assert result["auto_submitted"] is True
+    assert [step["step"] for step in result["steps"] if step["step"] in
+            {"auth", "recipients", "generate", "preview", "dry_run", "submit"}] == [
+                "auth", "recipients", "generate", "preview", "dry_run", "submit"]
+    dry_run, actual = fake.calls
+    assert dry_run[3] == {"dry_run": True}
+    assert actual[3] == {}
+    assert actual[1][0]["content"] == manual_body
+    assert json.loads(path.read_text(encoding="utf-8"))["submission"]["status"] == "verified"
+
+
+def test_generate_preserves_manual_saved_draft_if_saved_during_collection(tmp_path, monkeypatch):
+    import lablog.cli as cli
+    from lablog.workflow import atomic_json
+
+    cfg = _auto_config(tmp_path)
+    template = {"report_template_id": "t", "report_template_name": "学生日报",
+                "allowAddReceivers": 1,
+                "report_template_fields": [{"field_name": "今日完成", "field_sort": 0,
+                                             "field_type": 1}]}
+    manual_body = "网页刚保存的正文，应优先保留。"
+    prior = freeze_draft({"kind": "daily", "date": "2026-10-13", "template_id": "t",
+                          "template_name": "学生日报", "template_fingerprint": template_fingerprint(template),
+                          "fields": [{"name": "今日完成", "type": 1, "sort": 0, "value": manual_body}],
+                          "blockers": [], "warnings": [], "manual_saved": True,
+                          "approval_context": _approval_context(cfg, "daily", "2026-10-13")})
+    path = tmp_path / "data" / "drafts" / "daily-2026-10-13.json"
+    atomic_json(path, prior)
+    before = path.read_bytes()
+
+    class FakeDws:
+        def template(self, name, ident):
+            return template
+
+    monkeypatch.setattr(cli, "_client", lambda config: FakeDws())
+    monkeypatch.setattr(cli, "_collect", lambda *args: (tmp_path / "evidence.json", {
+        "facts": [{"evidence_id": "new", "status": "completed", "text": "newly collected work"}],
+        "warnings": []}))
+
+    returned_path, returned, info = cli._generate_impl(cfg, "daily", "2026-10-13", "extractive")
+
+    assert returned_path == path
+    assert returned == prior
+    assert info["action"] == "preserved_manual"
+    assert path.read_bytes() == before
+    assert json.loads(path.read_text(encoding="utf-8"))["fields"][0]["value"] == manual_body
 
 

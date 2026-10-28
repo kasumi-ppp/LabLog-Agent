@@ -23,8 +23,8 @@ from . import doctor
 from .dws import DwsBlocked, DwsClient, DwsNoReportId, encode_contents, template_fingerprint
 from .notify import send as send_notification
 from .periods import parse_period_marker, period_labels, format_period_marker
-from .report import CITATION, FIELDS, build_draft
-from .sources import collect_codex, collect_git, collect_markdown, period_bounds
+from .report import CITATION, FIELDS, build_draft, has_completion_body, reader_text
+from .sources import _normal_path, collect_codex, collect_git, collect_markdown, period_bounds
 from .workflow import (CorruptDocument, LockBusy, SubmissionBlocked, atomic_json, atomic_text,
                        draft_hash, file_lock, load_json_durable, multi_lock, record_diagnostic,
                        validate_submission)
@@ -34,7 +34,8 @@ CHINA = ZoneInfo("Asia/Shanghai")
 
 def _client(cfg):
     dws = cfg.get("dws") or {}
-    return DwsClient(dws.get("executable"), dws.get("profile"), int(dws.get("timeout_seconds", 30)))
+    return DwsClient(dws.get("executable"), dws.get("profile"), int(dws.get("timeout_seconds", 30)),
+                     validate_auth=bool(cfg.get('periodic')))
 
 
 def _path(cfg, kind, day, folder):
@@ -110,12 +111,18 @@ def _apply_scope(cfg, scope_file):
     supplemental = scoped.setdefault("supplemental", {})
     for key in SCOPE_CODEX_KEYS:
         if key in data:
-            codex[key] = _scope_list(data[key], key)
+            values = _scope_list(data[key], key)
+            if key == "exclude_paths":
+                # Scope files may narrow the run or add exclusions, but cannot
+                # undo exclusions established by the persistent profile.
+                values = list(dict.fromkeys([*(codex.get(key) or []), *values]))
+            codex[key] = values
     for key in SCOPE_SUPPLEMENTAL_KEYS:
         if key in data:
             supplemental[key] = _scope_list(data[key], key)
     if "project_paths" in data or "session_ids" in data:
         codex["mode"] = "selected"
+        codex["_explicit_run_scope"] = True
     scoped["scope_source"] = str(Path(scope_file).resolve())
     return scoped
 
@@ -124,6 +131,36 @@ def _scope_list(value, key):
     if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
         raise ValueError(f"scope {key} must be a list of strings")
     return value
+
+
+def _filter_excluded_paths(paths, excluded_paths):
+    """Drop supplemental roots that are inside or above a denied directory."""
+    excluded = tuple(filter(None, map(_normal_path, excluded_paths or [])))
+    return [path for path in paths
+            if not any((_normal_path(path) == blocked
+                        or _normal_path(path).startswith(blocked + "/")
+                        or blocked.startswith(_normal_path(path) + "/"))
+                       for blocked in excluded)]
+
+
+def _filter_excluded_facts(facts, excluded_paths):
+    """Keep cached facts only when their recorded source paths remain allowed."""
+    excluded = tuple(filter(None, map(_normal_path, excluded_paths or [])))
+    kept = []
+    for fact in facts or []:
+        source_paths = [_normal_path(fact.get(key)) for key in ("project", "source_path", "path")
+                        if fact.get(key)]
+        if any(path == blocked or path.startswith(blocked + "/") or blocked.startswith(path + "/")
+               for path in source_paths for blocked in excluded):
+            continue
+        kept.append(fact)
+    return kept
+
+
+def _filter_excluded_warnings(warnings, excluded_paths):
+    blocked = tuple(filter(None, map(_normal_path, excluded_paths or [])))
+    return [warning for warning in warnings or []
+            if not any(path in _normal_path(warning) for path in blocked)]
 
 
 def _source_report(name, role, paths, result):
@@ -163,36 +200,45 @@ def _evidence_write_decision(old, new, cfg):
     return "write", "ok"
 
 
-def _collect(cfg, kind, day):
+def _collect(cfg, kind, day, *, persist=True):
     codex = cfg.get("codex") or {}
     if codex.get("mode", "auto_work") not in {"auto_work", "selected"}:
         raise ValueError("Codex mode must be auto_work or selected")
-    if codex.get("mode") == "selected" and not (codex.get("session_ids") or codex.get("project_paths")):
+    from .conversations import ConversationIndex, enabled as conversations_enabled
+    indexed = conversations_enabled(cfg)
+    if not indexed and codex.get("mode") == "selected" and not (codex.get("session_ids") or codex.get("project_paths")):
         raise ValueError("selected mode requires project_paths or session_ids")
     paths = [resolve_path(cfg, x) for x in codex.get("session_roots", [])]
-    primary = collect_codex(paths, kind, date.fromisoformat(day),
+    primary = ConversationIndex(cfg).collect(kind, day) if indexed else collect_codex(paths, kind, date.fromisoformat(day),
                             project_paths=codex.get("project_paths", []),
                             session_ids=codex.get("session_ids", []),
                             exclude_paths=codex.get("exclude_paths", []))
     supplemental = cfg.get("supplemental") or {}
-    git_paths = [resolve_path(cfg, x) for x in supplemental.get("git_paths", [])]
-    markdown_paths = [resolve_path(cfg, x) for x in supplemental.get("markdown_paths", [])]
+    git_paths = _filter_excluded_paths(
+        [resolve_path(cfg, x) for x in supplemental.get("git_paths", [])], codex.get("exclude_paths", []))
+    markdown_paths = _filter_excluded_paths(
+        [resolve_path(cfg, x) for x in supplemental.get("markdown_paths", [])], codex.get("exclude_paths", []))
     git = collect_git(git_paths, kind, date.fromisoformat(day))
     md = collect_markdown(markdown_paths, kind, date.fromisoformat(day))
     source_facts = primary["facts"] + git["facts"] + md["facts"]
     facts = _deduplicate_facts(source_facts)
     warnings = primary["warnings"] + git["warnings"] + md["warnings"]
+    source_reports = ([{**s, "name": s['id'], "role": "primary", "configured": s.get('reachable') is not None,
+                        "reachable": s.get('reachable'), "fact_count": sum(f['source'] == s['id'] for f in primary['facts'])}
+                       for s in primary['sources']] if indexed else [_source_report("codex", "primary", paths, primary)])
     result = {"kind": kind, "date": day, "facts": facts,
               "collected_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
               "collector": {"pid": os.getpid(), "host": socket.gethostname(),
                             "scope_source": cfg.get("scope_source")},
-              "sources": [_source_report("codex", "primary", paths, primary),
-                          _source_report("git", "supplemental", git_paths, git),
+              "sources": [*source_reports, _source_report("git", "supplemental", git_paths, git),
                           _source_report("markdown", "supplemental", markdown_paths, md)],
+              "blockers": list(primary.get("blockers") or []),
               "source_fact_count": len(source_facts), "deduped_fact_count": len(facts),
               "warnings": warnings,
               "retention": {"action": "write", "reason": "ok", "previous_fact_count": None}}
     path = _path(cfg, kind, day, "evidence")
+    if not persist:
+        return path, result
     old = None
     if path.exists():
         try:
@@ -206,12 +252,21 @@ def _collect(cfg, kind, day):
     result["retention"]["action"] = action
     result["retention"]["reason"] = reason
     if action == "retain":
-        # Keep the stored evidence byte for byte; the rejected run is recorded.
+        # Retain prior allowed facts when a source is unreadable, but never let
+        # a persistent path exclusion re-enter the generated report via cache.
         record_diagnostic(path, "evidence", {"event": "rejected_collection", "reason": reason,
                                              "sources": result["sources"], "warnings": warnings})
         kept = dict(old or {})
+        kept["facts"] = _filter_excluded_facts(kept.get("facts"), codex.get("exclude_paths", []))
+        kept["source_fact_count"] = len(kept["facts"])
+        kept["deduped_fact_count"] = len(kept["facts"])
+        kept["sources"] = result["sources"]
+        kept["collector"] = result["collector"]
         kept["retention"] = result["retention"]
         kept["last_rejected_at"] = result["collected_at"]
+        kept["blockers"] = result["blockers"]
+        kept["warnings"] = _filter_excluded_warnings(
+            list(dict.fromkeys(list(kept.get('warnings') or []) + warnings)), codex.get("exclude_paths", []))
         return path, kept
     with file_lock(path):
         atomic_json(path, result, integrity=True, backup=True)
@@ -232,7 +287,9 @@ def _deduplicate_facts(facts):
         current = groups.get(key)
         provenance = {"evidence_id": fact.get("evidence_id"), "source": fact.get("source"),
                       "source_path": fact.get("source_path"), "status": fact.get("status"),
-                      "time": fact.get("time")}
+                      "time": fact.get("time"), "session_id": fact.get("session_id"),
+                      "message_id": fact.get("message_id"), "source_line": fact.get("source_line"),
+                      "conversation_key": fact.get("conversation_key")}
         if current is None:
             item = dict(fact)
             item["evidence_ids"] = [fact.get("evidence_id")] if fact.get("evidence_id") else []
@@ -561,6 +618,119 @@ def _fill_from_backlog(cfg, kind, day, draft, evidence):
     return {"status": "filled", "origin_date": origin, **summary}
 
 
+def _apply_weekly_carryover(cfg, kind, day, draft, evidence):
+    settings = (cfg.get('quality') or {}).get('weekly_carryover') or {}
+    if kind != 'weekly' or not settings.get('enabled'):
+        return {'status': 'disabled'}
+    target = _target_chars(settings)
+    from . import weekly_pool
+    monday = date.fromisoformat(day) - timedelta(days=date.fromisoformat(day).weekday())
+    previous_day = (monday - timedelta(days=1)).isoformat()
+    _, previous = _collect(cfg, 'weekly', previous_day, persist=False)
+    blockers = list(dict.fromkeys([*evidence.get('blockers', []), *previous.get('blockers', [])]))
+    for source in [*evidence.get('sources', []), *previous.get('sources', [])]:
+        if source.get('configured') and (source.get('reachable') is False or source.get('missing_paths')):
+            blockers.append('周报候补来源不可完整读取：' + str(source.get('name') or source.get('id')))
+    if blockers:
+        draft['blockers'] = list(dict.fromkeys([*draft.get('blockers', []), *blockers]))
+        return {'status': 'blocked', 'blockers': blockers}
+    weekly_pool.sync(cfg, day, [*previous.get('facts', []), *evidence.get('facts', [])])
+    name = FIELDS['weekly']['completed']
+    field = _field_by_name(draft, name)
+    if field is None:
+        return {'status': 'skipped', 'reason': 'completion field missing'}
+    prefix, body = _strip_period_marker(field.get('value', ''))
+    current_ids = _field_citation_ids(draft, name)
+    items = weekly_pool.load(cfg)['items']
+    reserved_ids = _seed_weekly_pool_receipts(cfg, day, items)
+    used = [item for item in items if set(item['evidence_ids']) & set(current_ids)]
+    selected = weekly_pool.select(cfg, day, max(0, target - char_count(body)),
+                                  exclude_evidence_ids=[*current_ids, *reserved_ids], exclude_texts=[body])
+    additions = []
+    for item in selected:
+        label = '上周补充' if item['week_start'] < monday.isoformat() else '本周补充'
+        additions.append(f"{label}（原始工作日期：{item['work_date']}）\n{reader_text(item['text'])}")
+    if additions:
+        field['value'] = (prefix or format_period_marker('weekly', day) + '\n') + '\n\n'.join(
+            [part for part in [body.strip(), *additions] if part])
+        draft['blockers'] = [b for b in draft.get('blockers', []) if b not in {'no dated completion evidence', 'empty completion body'}]
+        ids = list(dict.fromkeys([*current_ids, *(eid for item in selected for eid in item['evidence_ids'])]))
+        draft.setdefault('citations', {})[name] = ids
+        draft['evidence_ids'] = list(dict.fromkeys([*draft.get('evidence_ids', []), *ids]))
+        draft.setdefault('warnings', []).append('周报包含候补事项；请按原始工作日期理解，历史事项不代表本周新完成。')
+    used = {item['id']: item for item in [*used, *selected]}
+    draft['weekly_pool'] = {'target_chars': target, 'item_ids': list(used),
+                            'filled_items': [item['id'] for item in selected],
+                            'items': list(used.values()),
+                            'current_body': body, 'current_item_ids': [item['id'] for item in items if set(item['evidence_ids']) & set(current_ids)],
+                            'rendered_items': dict(zip([item['id'] for item in selected], additions)),
+                            'body_hash': hashlib.sha256(field['value'].encode('utf-8')).hexdigest()}
+    return {'status': 'applied', 'filled_items': draft['weekly_pool']['filled_items']}
+
+
+def _record_weekly_pool_receipt(cfg, draft, report_id):
+    metadata = draft.get('weekly_pool') or {}
+    if draft.get('kind') != 'weekly' or not metadata.get('item_ids'):
+        return 0
+    field = _field_by_name(draft, FIELDS['weekly']['completed'])
+    if field is None:
+        return 0  # An edited body no longer proves which generated candidates it used.
+    used = metadata['item_ids']
+    if hashlib.sha256(field['value'].encode('utf-8')).hexdigest() != metadata.get('body_hash'):
+        used = [ident for ident, text in metadata.get('rendered_items', {}).items() if text in field['value']]
+        if metadata.get('current_body', '').strip() and metadata['current_body'] in field['value']:
+            used += metadata.get('current_item_ids', [])
+    from . import weekly_pool
+    return weekly_pool.mark_reported(cfg, draft['date'], used, str(report_id)) if used else 0
+
+
+def _seed_weekly_pool_receipts(cfg, day, items):
+    """Respect weekly reports created before the pool, holding uncertain sends."""
+    from . import weekly_pool
+    monday = date.fromisoformat(day) - timedelta(days=date.fromisoformat(day).weekday())
+    weeks = {monday, monday - timedelta(days=7)}
+    reserved = []
+    root = resolve_path(cfg, cfg.get('data_dir', 'data')) / 'drafts'
+    for path in root.glob('weekly-*.json'):
+        try:
+            file_day = date.fromisoformat(path.stem.removeprefix('weekly-'))
+        except ValueError:
+            continue
+        if file_day - timedelta(days=file_day.weekday()) not in weeks:
+            continue
+        try:
+            saved = _read_draft(path)
+        except SubmissionBlocked:
+            raw, _ = load_json_durable(path)
+            record = state.load_period(state_path=_state_path(cfg, raw), draft=raw, draft_path=path)
+            if record.status:
+                raise  # Attempted reports must remain trustworthy for deduplication.
+            continue  # An unsubmitted edited draft does not prove prior weekly use.
+        saved_day = date.fromisoformat(saved['date'])
+        if saved_day - timedelta(days=saved_day.weekday()) not in weeks:
+            continue
+        record = state.load_period(state_path=_state_path(cfg, saved), draft=saved, draft_path=path)
+        if not record.status or record.status == 'not_submitted':
+            continue
+        ids = _field_citation_ids(saved, FIELDS['weekly']['completed'])
+        if record.status == 'verified' and record.report_id:
+            if saved.get('weekly_pool'):
+                _record_weekly_pool_receipt(cfg, saved, record.report_id)
+                continue
+            used = [item['id'] for item in items if set(item['evidence_ids']) & set(ids)]
+            if saved.get('manual_saved'):
+                field = _field_by_name(saved, FIELDS['weekly']['completed']) or {}
+                body = ' '.join(str(field.get('value', '')).split()).casefold()
+                proven = [item['id'] for item in items if item['id'] in used and ' '.join(reader_text(item['text']).split()).casefold() in body]
+                reserved.extend(eid for item in items if item['id'] in used and item['id'] not in proven for eid in item['evidence_ids'])
+                used = proven
+            if used:
+                weekly_pool.mark_reported(cfg, saved['date'], used, record.report_id)
+        elif record.status in {'unknown', 'mismatch', 'submitting', 'submitted'}:
+            reserved.extend(ids)
+    return list(dict.fromkeys(reserved))
+
+
 PROTECTED_DRAFT_STATUSES = {"submitting", "unknown", "verified", "submitted", "mismatch"}
 
 
@@ -618,6 +788,7 @@ def _generate_impl(cfg, kind, day, engine, manual_text_file=None, hours=None, ai
     draft["template_last_modified"] = template.get("lastModifiedTime")
     _apply_carryover(cfg, kind, day, draft, evidence)
     _fill_from_backlog(cfg, kind, day, draft, evidence)
+    _apply_weekly_carryover(cfg, kind, day, draft, evidence)
     draft["hash"] = draft_hash(draft)
     draft_path = _path(cfg, kind, day, "drafts")
     info = {"action": "written", "archive": None, "prior_hash": None}
@@ -632,6 +803,11 @@ def _generate_impl(cfg, kind, day, engine, manual_text_file=None, hours=None, ai
                 prior = None
         if prior is not None:
             info["prior_hash"] = prior.get("hash")
+            # Recheck under the shared file lock: the editor can save after
+            # _auto's initial read while collection/template lookup is running.
+            if prior.get("manual_saved") and draft_hash(prior) == prior.get("hash"):
+                info["action"] = "preserved_manual"
+                return draft_path, prior, info
             status = (prior.get("submission") or {}).get("status")
             if status in PROTECTED_DRAFT_STATUSES:
                 raise SubmissionBlocked("existing draft cannot be replaced after submit attempt")
@@ -798,6 +974,24 @@ def _verify_recipients(cfg, client):
     return user_ids, results, blockers
 
 
+def _fixed_receiver_policy(cfg, template_cfg, template, user_ids):
+    """allowAddReceivers=0: the template owns a fixed receiver list; we may only
+    send to exactly that list, never add or drop anyone at runtime."""
+    if template.get("allowAddReceivers") != 0:
+        return
+    declared = template_cfg.get("fixed_recipients")
+    if not isinstance(declared, list) or not declared:
+        raise SubmissionBlocked(
+            "template fixes its receivers but no fixed recipient list is declared for this template")
+    declared_ids = [str(r.get("user_id") or "") for r in declared if isinstance(r, dict)]
+    if not declared_ids or any(not x for x in declared_ids):
+        raise SubmissionBlocked("declared fixed recipient list is incomplete")
+    if len(set(declared_ids)) != len(declared_ids):
+        raise SubmissionBlocked("declared fixed recipient list has duplicates")
+    if set(declared_ids) != set(user_ids) or len(declared_ids) != len(user_ids):
+        raise SubmissionBlocked("configured recipients do not match the template's fixed receiver list")
+
+
 def _preview_markdown(draft, context, duplicate):
     start, end = _period_labels(draft["kind"], draft["date"])
     identity = context.get("identity") or {}
@@ -835,8 +1029,20 @@ def _preview_markdown(draft, context, duplicate):
 def _preflight(cfg, draft, *, duplicate_check=True):
     if draft.get("blockers"):
         raise SubmissionBlocked("draft has unresolved blockers: " + "; ".join(draft["blockers"]))
+    completion_name = FIELDS.get(draft.get('kind'), {}).get('completed')
+    for field in draft.get('fields', []):
+        if field.get('name') == completion_name and not has_completion_body(field.get('value')):
+            raise SubmissionBlocked('empty completion body: report contains only a period marker or blank text')
     if draft.get("approval_context") != _approval_context(cfg, draft["kind"], draft["date"]):
         raise SubmissionBlocked("identity, recipients, template or encoding policy changed since approval")
+    from .conversations import ConversationIndex, enabled as conversations_enabled
+    if draft.get('source_snapshot') is not None:
+        from .report_sources import verify_snapshot
+        verify_snapshot(draft['source_snapshot'], cfg, draft['kind'], draft['date'])
+    elif conversations_enabled(cfg):
+        current = ConversationIndex(cfg).collect(draft['kind'], draft['date'])
+        if current['blockers']:
+            raise SubmissionBlocked('selected conversation source unavailable: ' + '; '.join(current['blockers']))
     client = _client(cfg)
     auth = client.auth()
     identity = cfg.get("identity") or {}
@@ -853,8 +1059,7 @@ def _preflight(cfg, draft, *, duplicate_check=True):
     user_ids, _, recipient_blockers = _verify_recipients(cfg, client)
     if recipient_blockers:
         raise SubmissionBlocked("; ".join(recipient_blockers))
-    if template.get("allowAddReceivers") == 0:
-        raise SubmissionBlocked("template disallows adding explicit recipients; receiver semantics unverified")
+    _fixed_receiver_policy(cfg, template_cfg, template, user_ids)
     if duplicate_check and _has_period_duplicate(cfg, client, template_cfg["name"], draft):
         raise SubmissionBlocked("remote report already exists for this template and period")
     contents = encode_contents(draft, template, cfg.get("date_encoding") or {})
@@ -968,6 +1173,7 @@ def _submit(cfg, path, confirm):
                 raise SubmissionBlocked(reason)
             _record_submission(state_path, path, draft, "verified", phase=state.PHASE_COMPLETED,
                                report_id=report_id, reason="remote read-back matched")
+            _record_weekly_pool_receipt(cfg, draft, report_id)
             # Only a verified submission consumes backlog prose. An unknown or
             # mismatched outcome must keep it so it can be resubmitted later.
             filled = (draft.get("carryover") or {}).get("filled_items") or []
@@ -1008,6 +1214,8 @@ def _reconcile(cfg, path):
                 if record.report_id:
                     submission["report_id"] = record.report_id
                 atomic_json(path, draft)
+            if status == 'verified' and record.report_id:
+                _record_weekly_pool_receipt(cfg, draft, record.report_id)
             return {"status": status or "not_submitted", "draft": str(path),
                     "attempt_id": record.attempt_id}
         client = _client(cfg)
@@ -1047,6 +1255,7 @@ def _reconcile(cfg, path):
                 atomic_json(path, draft)
                 state.transition(state_path, to_status="verified", phase=state.PHASE_COMPLETED,
                                  report_id=report_id, reason="remote read-back matched during reconcile")
+                _record_weekly_pool_receipt(cfg, draft, report_id)
                 filled = (draft.get("carryover") or {}).get("filled_items") or []
                 if filled:
                     consumed = mark_consumed(cfg, filled, draft["date"], str(report_id))
@@ -1253,7 +1462,13 @@ def _auto(cfg, kind, day, engine, *, submit=False, manual_text_file=None, hours=
         except (DwsBlocked, SubmissionBlocked) as exc:
             return stop("blocked", f"precondition failed: {exc}")
 
-        draft_path, draft = _generate(cfg, kind, day, engine, manual_text_file, hours, ai_result_file)
+        # The workspace saves into the same draft file used by the scheduler.
+        # A saved human version is the submission candidate; collection must not replace it.
+        saved = _read_draft(existing) if existing.exists() else None
+        if saved and saved.get("manual_saved"):
+            draft_path, draft = existing, saved
+        else:
+            draft_path, draft = _generate(cfg, kind, day, engine, manual_text_file, hours, ai_result_file)
         steps.append({"step": "generate", "status": "drafted", "hash": draft["hash"],
                       "blockers": list(draft.get("blockers") or [])})
 
