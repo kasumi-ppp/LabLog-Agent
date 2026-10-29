@@ -7,7 +7,7 @@ name = "lablog-agent"
 version = "0.1.0"
 description = "Evidence-grounded Codex work reports using the official DingTalk DWS CLI"
 requires-python = ">=3.11"
-dependencies = ["PyYAML>=6", "jsonschema>=4", "tzdata>=2024"]
+dependencies = ["PyYAML>=6", "jsonschema>=4", "tzdata>=2024", "zstandard>=0.22"]
 
 [project.optional-dependencies]
 test = ["pytest>=8"]

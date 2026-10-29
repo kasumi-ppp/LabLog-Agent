@@ -146,10 +146,11 @@ def extract_report_id(data):
 
 
 class DwsClient:
-    def __init__(self, executable, profile, timeout=30):
+    def __init__(self, executable, profile, timeout=30, *, validate_auth=False):
         if not executable or not profile:
             raise DwsBlocked("DWS executable and profile required")
         self.executable, self.profile, self.timeout = str(executable), str(profile), timeout
+        self.validate_auth = validate_auth
 
     def call(self, parts, *, stdin=None, mutating=False, dry_run=False):
         argv = [self.executable, "--profile", self.profile, "--format", "json"]
@@ -172,7 +173,10 @@ class DwsClient:
         return data
 
     def auth(self):
-        result = self.call(["auth", "status", "--readonly"])
+        # --readonly can intentionally report token_valid=null. Periodic
+        # activation needs the official selected-slot validation/refresh path;
+        # existing daily configurations retain their original auth behavior.
+        result = self.call(["auth", "status"] if self.validate_auth else ["auth", "status", "--readonly"])
         if result.get("success") is not True or result.get("authenticated") is not True or result.get("token_valid") is not True:
             raise DwsBlocked("DWS authentication unavailable")
         return result

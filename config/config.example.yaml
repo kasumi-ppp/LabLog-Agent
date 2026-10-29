@@ -17,6 +17,20 @@ codex:
 supplemental:
   git_paths: []
   markdown_paths: []
+# Shared session directory/selection for both the CLI and WebUI. Optional;
+# older configurations without these sections keep the legacy collection path.
+conversations:
+  enabled: false
+workbuddy:
+  enabled: false
+  root: C:/Users/USERNAME/.workbuddy
+  # Omit project_paths/exclude_paths to inherit the Codex project defaults.
+  # Manual per-session choices can extend project defaults; exclusions always win.
+chatgpt:
+  enabled: false
+  root: data-chatgpt/source
+  session_ids: []  # Explicit ChatGPT conversation IDs only; never scan all chats.
+  max_age_hours: 24  # Snapshots refreshed by a Codex app monitor, not the DWS sender.
 identity:
   corp_id: ""
   user_id: ""
@@ -50,6 +64,11 @@ quality:
     apply_to:
       - completed
     plan_extra: true
+  # 周报不足目标字数时，优先本周，再补上周尚未进周报的完成事项。
+  # 候选仅保留原周及下一周；下下周清理候选，原始会话与提交记录不删除。
+  weekly_carryover:
+    enabled: false
+    target_chars: 200
 history_from: "2026-01-01"  # Required for remote duplicate guard, earliest report to inspect.
 calendar:
   file: config/calendars/2026.json

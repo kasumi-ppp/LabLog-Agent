@@ -22,6 +22,8 @@ def load_config(path):
     quality["carryover"] = {"enabled": False, "target_chars": 200,
                             "apply_to": ["completed"], "plan_extra": True,
                             **(quality.get("carryover") or {})}
+    quality['weekly_carryover'] = {'enabled': False, 'target_chars': 200,
+                                  **(quality.get('weekly_carryover') or {})}
     return config
 
 

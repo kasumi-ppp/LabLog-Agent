@@ -22,3 +22,6 @@ config/config.local.yaml
 config/config.auto.yaml
 config/config.vr.yaml
 config/config.vr-fix.yaml
+config/config.periodic.local.yaml
+config/config.weekly-catchup.local.yaml
+webapp/backend/*.db*

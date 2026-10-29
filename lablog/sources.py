@@ -12,7 +12,10 @@ from zoneinfo import ZoneInfo
 import yaml
 
 CHINA = ZoneInfo("Asia/Shanghai")
-SECRET = re.compile(r"(?i)(api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)\s*[:=]\s*\S+|-----BEGIN (?:RSA |OPENSSH )?PRIVATE KEY-----")
+SECRET = re.compile(
+    r'''(?i)(api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)["']?\s*[:=]\s*'''
+    r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\S+)|\bBearer\s+\S+|-----BEGIN (?:RSA |OPENSSH )?PRIVATE KEY-----'''
+)
 DONE = re.compile(r"(?i)(?:^|[。！\n])\s*(?:[-*]\s*)?(?:我)?(?:已完成|完成了|已实现|已修复|已提交|测试通过|实现完成|修复完成|implemented|fixed|completed|done|tests pass(?:ed)?)")
 PROGRESS = re.compile(r"(?i)(?:正在|进行中|working on|in progress)")
 
@@ -33,7 +36,10 @@ def period_bounds(kind: str, day: date):
 
 
 def _normal_path(value):
-    return str(value or "").replace("\\", "/").rstrip("/").casefold()
+    path = str(value or "").replace("\\", "/").rstrip("/").casefold()
+    if path.startswith("//?/unc/"):
+        return "//" + path[8:]
+    return path[4:] if path.startswith("//?/") else path
 
 
 def _allowed(cwd, projects, excluded):

@@ -43,9 +43,15 @@ def _evidence_lines(facts, statuses):
             continue
         if len(text) > 500:
             text = text[:500] + "…"
-        qualifier = "（会话报告，未独立核验）" if fact.get("source") == "codex" and fact.get("status") == "completed" else ""
+        qualifier = "（会话报告，未独立核验）" if fact.get("source") in {"codex", "workbuddy", "chatgpt"} and fact.get("status") == "completed" else ""
         lines.append(f"- {text}{qualifier} [证据:{fact['evidence_id']}]")
     return "\n".join(lines)
+
+
+def has_completion_body(value):
+    text = reader_text(str(value or ''))
+    text = re.sub(r'(?m)^\s*统计周期\s*[：:][^\n]*(?:\n|$)', '', text)
+    return bool(text.strip(' \t\r\n-*•#>'))
 
 
 def build_draft(kind, day, template, evidence, *, manual_text=None, hours=None, ai_result=None):
@@ -54,7 +60,7 @@ def build_draft(kind, day, template, evidence, *, manual_text=None, hours=None, 
     names = FIELDS[kind]
     facts = evidence.get("facts", [])
     committed = _evidence_lines(facts, {"completed", "committed"})
-    blockers = []
+    blockers = list(evidence.get('blockers') or [])
     if not committed:
         blockers.append("no dated completion evidence")
     completed = committed
@@ -82,9 +88,17 @@ def build_draft(kind, day, template, evidence, *, manual_text=None, hours=None, 
         if not parsed.is_finite() or parsed < 0 or parsed > 24:
             raise ValueError("invalid hours")
         values[names["hours"]] = format(parsed, "f")
+    extras = (ai_result or {}).get('extra_fields', {})
+    live_text_names = {f['field_name'] for f in template_fields(template) if int(f['field_type']) == 1}
+    if set(extras) - live_text_names or set(extras) & set(names.values()):
+        # Coordination is a core mapping but has no other generated value.
+        forbidden = set(extras) & (set(names.values()) - {names['coordination']})
+        if set(extras) - live_text_names or forbidden:
+            raise ValueError('extra_fields cannot override core or unknown template fields')
+    values.update(extras)
     fields = []
     citations = {}
-    for name in (names["completed"], names["summary"], names.get("plan")):
+    for name in values:
         if not name or not isinstance(values.get(name), str):
             continue
         found = sorted(set(CITATION.findall(values[name])))
@@ -93,8 +107,24 @@ def build_draft(kind, day, template, evidence, *, manual_text=None, hours=None, 
         citations[name] = found
         values[name] = reader_text(values[name])
     values[names["completed"]] = format_period_marker(kind, day) + "\n" + values[names["completed"]]
+    if not has_completion_body(values[names['completed']]) and 'no dated completion evidence' not in blockers:
+        blockers.append('empty completion body')
     for field in template_fields(template):
         name = field["field_name"]
+        value = values.get(name)
+        if any(field.get(k) in (True, 1, 'true') for k in ('required', 'is_required', 'isRequired')) and not value:
+            blockers.append(f'required field missing: {name}')
+        for keys, direction in ((('minLength', 'min_length'), 'min'), (('maxLength', 'max_length'), 'max')):
+            for key in keys:
+                limit = field.get(key)
+                if limit is not None and value is not None:
+                    try:
+                        violated = len(str(value)) < int(limit) if direction == 'min' else len(str(value)) > int(limit)
+                    except (ValueError, TypeError):
+                        blockers.append(f'unrecognized template constraint {name}: {key}')
+                    else:
+                        if violated:
+                            blockers.append(f'template constraint {name}: {key}={limit}')
         if name in values:
             fields.append({"name": name, "type": int(field["field_type"]),
                            "sort": int(field["field_sort"]), "value": values[name]})

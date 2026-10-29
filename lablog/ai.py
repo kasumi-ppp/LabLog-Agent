@@ -58,24 +58,37 @@ def _asserts_completion(text):
     return False
 
 
-def validate_ai_result(result, facts):
+def validate_ai_result(result, facts, *, extra_fields=None):
     allowed = {x["evidence_id"] for x in facts}
-    if not isinstance(result, dict) or set(result) != {"completed", "summary", "plan", "citations"}:
+    required = {"completed", "summary", "plan", "citations"}
+    if not isinstance(result, dict) or not required <= set(result) or set(result) - required - {"extra_fields"}:
         raise ValueError("Codex output schema mismatch")
+    extras = result.get('extra_fields', {})
+    if (not isinstance(extras, dict) or not set(extras) <= set(extra_fields or {})
+            or not all(isinstance(v, str) for v in extras.values())):
+        raise ValueError('AI extra_fields must match supported live template fields')
     if not all(isinstance(result[k], str) for k in ("completed", "summary", "plan")):
         raise ValueError("Codex output text invalid")
     if not isinstance(result["citations"], list) or not result["citations"] or not all(isinstance(x, str) for x in result["citations"]) or not set(result["citations"]) <= allowed:
         raise ValueError("Codex citations missing or unknown")
-    text = result["completed"] + "\n" + result["summary"] + "\n" + result["plan"]
+    text = '\n'.join([result['completed'], result['summary'], result['plan'], *extras.values()])
     if not all("[证据:" + cid + "]" in text for cid in result["citations"]):
         raise ValueError("Codex citations absent from prose")
     fact_by_id = {x["evidence_id"]: x for x in facts}
+    for name, value in extras.items():
+        category = extra_fields[name]
+        for line in value.splitlines():
+            cited = re.findall(r'\[证据:([^\]]+)\]', line)
+            if any(category not in fact_by_id.get(c, {}).get('categories', []) for c in cited):
+                raise ValueError('AI extra field cites evidence from another business category')
     for line in text.splitlines():
         if not line.strip():
             continue
         cited = re.findall(r"\[证据:([^\]]+)\]", line)
         if not cited or not set(cited) <= allowed:
             raise ValueError("Codex claim lacks known source citation")
+        if not set(cited) <= set(result['citations']):
+            raise ValueError('AI prose citation missing from citations list')
         prose = re.sub(r"\[证据:[^\]]+\]", "", line)
         source_text = " ".join(str(fact_by_id[c].get("text", "")) for c in cited)
         if any(not _has_lexical_support(prose, str(fact_by_id[c].get("text", ""))) for c in cited):

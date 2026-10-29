@@ -4,6 +4,8 @@
 
 使用官方 DWS CLI 和现有账号认证。无需企业管理员权限，也不新建钉钉 API 客户端、MCP Server 或数据库。能够生成草稿并不意味着当前账号一定拥有真实提交权限，需单独验收。
 
+周报、月报由 WorkBuddy 在本机执行的方案见 [WorkBuddy 周报、月报说明书](docs/workbuddy-periodic-reports.md)。独立入口 `python -X utf8 -m lablog.periodic` 在周日和月末到期时，冻结“日报→周报、日报＋周报→月报”的来源，接受 WorkBuddy 的 assisted 摘要，再复用预览、查重、提交和读回核验。该入口使用独立配置与 `data-periodic`，不改变现有日报；初始化默认禁止提交，需当天两种真实无写入试跑通过后启用。定时任务在 WorkBuddy 中设置，每天默认22:00启动。
+
 ## 快速开始
 
 Python 3.11+，已有官方 DWS、Codex CLI 和钉钉官方技能。
@@ -97,7 +99,7 @@ python -X utf8 -m lablog --config config/config.auto.yaml auto --kind daily --su
 
 ### 范围接口（供 Codex / 其它 agent 调用）
 
-当前默认证据范围（2026-10-13 用户划定，见 `config/config.auto.yaml`）：只采 **`E:\project\galgame news`、`E:\project\Comfyui`、`E:\project\VR`** 三个项目——Codex 会话按 `cwd` 前缀匹配，`git_paths` 列出这三个项目下的全部仓库（`galgame news`、`VR\TBM-ui-fix`、`VR\TBMproject`、`VR\TBMproject-remote-metadata`）。注意 `Comfyui` 不是 git 仓库，只能靠会话记录采集。
+当前日报监控范围（2026-10-23，见 `config/config.auto.yaml`）：采集 **`E:\project\VR` 和 `E:\Open Science`**；`E:\project\galgame news` 与 `E:\project\Comfyui` 均加入本机报告配置的排除规则。已保存或临时手动选入的 Codex / WorkBuddy 会话，以及 Git / Markdown 补充来源都不能越过排除规则。Codex 会话按 `cwd` 前缀匹配，文件来源只读取明确配置且未被排除的路径。
 
 运行范围不写死在代码里。任何工具写一份 scope JSON 即可决定「这次运行可以看哪些证据」：
 
