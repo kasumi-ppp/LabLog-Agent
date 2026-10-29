@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark">
+<title>钉钉 AI 日志 · 工作台</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%231677ff'/%3E%3Cpath d='M9 9h14l-8 8h7L12 26l3-9H9z' fill='white'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css"><script src="/static/app.js" defer></script>
+</head><body>
+<header class="topbar">
+  <a class="brand" href="/" aria-label="首页"><span class="brand-mark">ϟ</span><span>钉钉 <strong>AI 日志</strong></span><span class="version">WORKSPACE</span></a>
+  <nav class="main-nav" aria-label="报告类型"><button class="nav-tab active" data-kind="daily">日报</button><button class="nav-tab" data-kind="weekly">周报</button><button class="nav-tab" data-kind="monthly">月报</button><button id="history-btn" class="nav-tab">历史记录</button></nav>
+  <div class="header-actions">
+    <div class="date-control"><button id="prev-date" class="icon-button" aria-label="上一天" data-icon="chevron-left"></button><label class="date-label"><span data-icon="calendar"></span><input id="date" type="date" aria-label="工作日期"></label><button id="next-date" class="icon-button" aria-label="下一天" data-icon="chevron-right"></button></div>
+    <button id="sync-btn" class="button primary"><span data-icon="refresh"></span><span>同步最新会话</span></button>
+    <span id="sync-state" class="sync-state"><i class="dot"></i>等待同步</span>
+    <button id="theme-btn" class="icon-button" aria-label="切换深浅主题" data-icon="moon"></button><button id="settings-btn" class="icon-button" aria-label="自动化与数据源设置" data-icon="settings"></button><span class="avatar user-avatar">U</span>
+  </div>
+</header>
+<main class="workspace">
+  <aside id="tasks-panel" class="panel tasks-panel">
+    <div class="panel-heading"><div><span class="step">1</span><h1>会话与任务</h1></div><button class="icon-button mobile-close" id="close-tasks" aria-label="收起任务列表" data-icon="chevron-left"></button><span class="small-label">SOURCES</span></div>
+    <div class="source-tabs" role="group" aria-label="会话来源"><button class="active" data-source="all">全部 <span id="count-all">0</span></button><button data-source="codex">Codex <span id="count-codex">0</span></button><button data-source="workbuddy">WorkBuddy <span id="count-workbuddy">0</span></button><button data-source="chatgpt">ChatGPT <span id="count-chatgpt">0</span></button></div>
+    <div class="search-box"><span data-icon="search"></span><input id="task-search" placeholder="搜索会话或任务…" aria-label="搜索会话或任务"><kbd>⌘ K</kbd></div>
+    <div class="filters"><select id="project-filter" aria-label="按项目筛选"><option value="">全部项目</option></select><select id="status-filter" aria-label="按状态筛选"><option value="">全部状态</option><option value="implemented_unverified">待验证</option><option value="verified_completed">已验证</option><option value="in_progress">进行中</option><option value="planned">计划中</option><option value="blocked">受阻</option><option value="unknown">待确认</option></select></div>
+    <div class="tree-toolbar"><span id="task-count">0 个任务</span><button id="select-all" class="text-button">选择当前结果</button></div>
+    <div id="task-tree" class="task-tree" aria-label="项目任务树"></div>
+    <div id="conversation-paging" class="conversation-paging" hidden><button id="conversations-prev" class="text-button">上一页</button><span id="conversation-page"></span><button id="conversations-next" class="text-button">下一页</button></div>
+    <button id="add-manual" class="manual-button"><span data-icon="plus"></span>添加线下工作<span class="small-label">手动记录</span></button>
+    <div class="stats-card"><div class="stats-title">任务覆盖<span id="stats-date"></span></div><div class="stats-content"><div class="stat-labels"><span><i class="dot green"></i>已选择 <b id="selected-count">0</b></span><span><i class="dot muted"></i>未选择 <b id="unselected-count">0</b></span><span><i class="dot amber"></i>待确认 <b id="unknown-count">0</b></span></div><div class="coverage"><div class="coverage-ring" id="coverage-ring"><span id="coverage-value">0<small>/0</small></span></div><span id="coverage-percent">覆盖率 0%</span></div></div></div>
+    <div class="panel-footnote"><span data-icon="shield"></span>仅采集已授权的工作范围</div>
+  </aside>
+  <div class="splitter" id="split-left" role="separator" aria-label="调整任务栏宽度" aria-orientation="vertical" tabindex="0"></div>
+  <section class="panel evidence-panel">
+    <div class="panel-heading"><div><button class="icon-button mobile-open" id="open-tasks" aria-label="展开任务列表" data-icon="menu"></button><span class="step">2</span><h2>会话详情与原始内容</h2></div><span class="small-label">EVIDENCE</span></div>
+    <div id="task-info" class="task-info"><div class="breadcrumb">工作空间 <span>/</span> 选择任务查看证据</div><h3>每一项工作，都有迹可循</h3><p>从左侧选择任务，查看它的真实来源与工作状态。</p></div>
+    <div class="evidence-tabs" role="tablist" aria-label="证据视图"><button class="active" data-view="messages" role="tab" aria-selected="true">原始对话</button><button data-view="tools" role="tab" aria-selected="false">执行记录</button><button data-view="summary" role="tab" aria-selected="false">任务摘要</button></div>
+    <div class="evidence-toolbar"><span id="evidence-caption">按需读取原始证据</span><div class="evidence-search"><span data-icon="search"></span><input id="evidence-search" placeholder="在当前页证据中查找…" aria-label="在证据中查找"></div></div>
+    <div id="evidence-content" class="evidence-content"></div>
+    <div class="evidence-footer"><span data-icon="lock"></span><span>原始内容仅供预览 · 不修改源会话</span><span class="live-label"><i class="dot green"></i>本地读取</span></div>
+  </section>
+  <div class="splitter" id="split-right" role="separator" aria-label="调整日志栏宽度" aria-orientation="vertical" tabindex="0"></div>
+  <section class="panel report-panel">
+    <div class="panel-heading"><div><span class="step">3</span><h2 id="report-heading">日报生成与编辑</h2></div><span class="badge neutral" id="report-status">尚未生成</span></div>
+    <div class="report-meta"><span><i class="dot green"></i><span id="report-date-label"></span></span><span id="save-state" aria-live="polite">内容保存在服务器</span></div>
+    <div id="section-tabs" class="section-tabs"><button class="active" data-section="completed">今日工作</button><button data-section="progress">当前进展</button><button data-section="problems">遇到问题</button><button data-section="solutions">解决措施</button><button data-section="plan">后续计划</button></div>
+    <div class="editor-shell"><div class="editor-toolbar"><span class="document-label"><span data-icon="file"></span>工作日志</span><button id="generate-btn" class="button primary compact"><span data-icon="sparkles"></span>生成草稿</button></div><div id="report-editor" class="report-editor"></div><div class="editor-bottom"><span>支持直接编辑 · 自动保存</span><span id="word-count">0 字</span></div></div>
+    <div id="report-alert" class="report-alert" hidden></div>
+    <div class="automation-card"><span class="automation-icon" data-icon="clock"></span><div><strong id="automation-title">后台自动发送</strong><p id="automation-description">读取现有自动化配置中…</p></div><button id="automation-settings" class="icon-button" aria-label="查看自动发送设置" data-icon="chevron-right"></button></div>
+    <div class="report-actions"><button id="save-btn" class="button"><span data-icon="save"></span>保存草稿</button><button id="preview-btn" class="button"><span data-icon="eye"></span>预览效果</button><button id="submit-btn" class="button primary"><span data-icon="send"></span>提交到钉钉</button></div>
+    <p class="report-footnote"><span data-icon="shield"></span>已授权的自动任务在浏览器关闭后仍可独立运行</p>
+  </section>
+</main>
+<div id="toast" class="toast" role="status" hidden></div>
+<dialog id="modal"><div class="modal-header"><h2 id="modal-title"></h2><button class="icon-button" id="modal-close" aria-label="关闭窗口" data-icon="x"></button></div><div id="modal-body" class="modal-body"></div></dialog>
+</body></html>
